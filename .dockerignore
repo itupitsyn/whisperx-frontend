@@ -1,0 +1,10 @@
+node_modules
+.nuxt
+.output
+.git
+.github
+*.log
+.env
+.env.*
+dist
+image.tar.gz

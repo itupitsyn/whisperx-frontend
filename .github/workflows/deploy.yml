@@ -1,0 +1,52 @@
+name: Deploy to VDS
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch: {}
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build image and save to archive
+        run: |
+          docker build \
+            --build-arg WHISPERX_API_URL="${{ secrets.WHISPERX_API_URL }}" \
+            -t whisperx-frontend:latest .
+          docker save whisperx-frontend:latest | gzip > image.tar.gz
+
+      - name: Copy image to VDS /tmp
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.VDS_HOST }}
+          username: ${{ secrets.VDS_USER }}
+          password: ${{ secrets.VDS_PASSWORD }}
+          port: ${{ secrets.VDS_PORT || 22 }}
+          source: "image.tar.gz"
+          target: "/tmp"
+
+      - name: Load image and restart
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VDS_HOST }}
+          username: ${{ secrets.VDS_USER }}
+          password: ${{ secrets.VDS_PASSWORD }}
+          port: ${{ secrets.VDS_PORT || 22 }}
+          script: |
+            set -e
+            # docker load сам распознаёт gzip
+            docker load -i /tmp/image.tar.gz
+            # сносим старый контейнер (если есть) и поднимаем новый
+            docker rm -f whisperx-frontend 2>/dev/null || true
+            docker run -d \
+              --name whisperx-frontend \
+              --restart unless-stopped \
+              -p 3200:3000 \
+              -e HOST=0.0.0.0 -e PORT=3000 \
+              whisperx-frontend:latest
+            docker image prune -f
+            rm -f /tmp/image.tar.gz
