@@ -1,0 +1,6 @@
+{
+  // https://nuxt.com/docs/guide/concepts/typescript
+  // Подключает сгенерированные Nuxt типы (auto-imports: ref, computed, $fetch, ...).
+  // Файл создаётся командой `nuxt prepare` (запускается в postinstall).
+  "extends": "./.nuxt/tsconfig.json"
+}
