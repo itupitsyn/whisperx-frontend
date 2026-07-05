@@ -42,11 +42,15 @@ jobs:
             docker load -i /tmp/image.tar.gz
             # сносим старый контейнер (если есть) и поднимаем новый
             docker rm -f whisperx-frontend 2>/dev/null || true
+            # Том для разметки — чтобы данные переживали редеплой контейнера
+            mkdir -p /opt/whisperx-frontend/data
             docker run -d \
               --name whisperx-frontend \
               --restart unless-stopped \
               -p 3200:3000 \
               -e HOST=0.0.0.0 -e PORT=3000 \
+              -e ANNOTATIONS_DIR=/app/data/annotations \
+              -v /opt/whisperx-frontend/data:/app/data \
               whisperx-frontend:latest
             docker image prune -f
             rm -f /tmp/image.tar.gz
