@@ -89,14 +89,18 @@ const TAP_MS = 300
 let clickTimer: ReturnType<typeof setTimeout> | null = null
 let lastTap = { idx: -1, t: 0 }
 function onWordClick(w: RWord) {
-  const sel = window.getSelection()
-  if (sel && !sel.isCollapsed) return
   const now = Date.now()
+  // Двойной тап проверяем ПЕРВЫМ: на десктопе он выделяет слово браузером,
+  // и проверка выделения ниже иначе съела бы событие до входа в правку.
   if (w.idx === lastTap.idx && now - lastTap.t < TAP_MS) {
     lastTap = { idx: -1, t: 0 }
-    startEdit(w) // сам отменит отложенную перемотку
+    startEdit(w) // сам отменит отложенную перемотку и снимет выделение
     return
   }
+  // Одиночный: если есть выделение (пользователь выделяет текст для разметки) —
+  // не перематываем.
+  const sel = window.getSelection()
+  if (sel && !sel.isCollapsed) return
   lastTap = { idx: w.idx, t: now }
   if (clickTimer) clearTimeout(clickTimer)
   clickTimer = setTimeout(() => {
@@ -246,16 +250,22 @@ const pickerGroups = computed(() =>
     : [{ group: 'Аудио', items: AUDIO_EFFECTS }]
 )
 
-function onSelect(e: MouseEvent) {
-  // Двойной/тройной клик — это жест редактирования слова, не разметки.
-  if (e.detail >= 2) return
+// Реакция на изменение выделения. Слушаем document `selectionchange` (с
+// дебаунсом) вместо mouseup — так работает и мышью на десктопе, и выделением
+// пальцем на мобилке (где mouseup при выделении через лупу/маркеры не приходит).
+let selTimer: ReturnType<typeof setTimeout> | null = null
+function onSelectionChange() {
+  if (selTimer) clearTimeout(selTimer)
+  selTimer = setTimeout(evaluateSelection, 250)
+}
 
+function evaluateSelection() {
   const sel = window.getSelection()
-  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return hidePicker()
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
 
   const range = sel.getRangeAt(0)
   const c = transcriptEl.value
-  if (!c || !c.contains(range.commonAncestorContainer)) return hidePicker()
+  if (!c || !c.contains(range.commonAncestorContainer)) return
 
   // Берём все слова, чей диапазон пересекается с выделением
   // (containsNode не годится: часть одного слова им не ловится).
@@ -275,7 +285,7 @@ function onSelect(e: MouseEvent) {
   const ends = chosen
     .map((el) => parseFloat(el.dataset.end ?? ''))
     .filter((n) => !isNaN(n))
-  if (!starts.length || !ends.length) return hidePicker()
+  if (!starts.length || !ends.length) return
 
   pending.value = {
     start: Math.min(...starts),
@@ -323,8 +333,14 @@ function onDocMouseDown(e: MouseEvent) {
   if (f && !f.contains(e.target as Node)) hidePicker()
 }
 
-onMounted(() => document.addEventListener('mousedown', onDocMouseDown))
-onBeforeUnmount(() => document.removeEventListener('mousedown', onDocMouseDown))
+onMounted(() => {
+  document.addEventListener('mousedown', onDocMouseDown)
+  document.addEventListener('selectionchange', onSelectionChange)
+})
+onBeforeUnmount(() => {
+  document.removeEventListener('mousedown', onDocMouseDown)
+  document.removeEventListener('selectionchange', onSelectionChange)
+})
 
 // ---- загрузка файла ----
 function pick() {
@@ -543,7 +559,7 @@ function fmt(t?: number) {
           Выделите текст → выберите класс нарушения. Тап/клик по слову —
           перемотка, двойной тап/клик — исправить слово.
         </p>
-        <div ref="transcriptEl" class="segments" @mouseup="onSelect($event)">
+        <div ref="transcriptEl" class="segments">
           <div v-for="seg in renderSegments" :key="seg.key" class="segment">
             <span class="time" @click="seek(seg.start)">{{ fmt(seg.start) }}</span>
             <span v-if="seg.speaker" class="speaker">{{ seg.speaker }}</span>
@@ -792,7 +808,12 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   font-weight: 600;
   white-space: nowrap;
 }
-.words { line-height: 1.7; }
+.words {
+  line-height: 1.7;
+  /* явно разрешаем выделение текста (важно для iOS Safari) */
+  -webkit-user-select: text;
+  user-select: text;
+}
 .word {
   cursor: pointer;
   border-bottom: 2px solid transparent;
