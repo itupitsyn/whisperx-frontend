@@ -1,3 +1,6 @@
+import { sha256File } from '~/utils/fileHash'
+import type { SavedSegment } from '~/composables/useAnnotations'
+
 export type TranscriptionStatus =
   | 'idle'
   | 'uploading'
@@ -51,6 +54,9 @@ function errText(err: unknown): string {
 export function useTranscription() {
   const status = ref<TranscriptionStatus>('idle')
   const jobId = ref<string | null>(null)
+  // Контент-хеш файла (SHA-256) — стабильный ключ для привязки разметки к файлу,
+  // не зависящий от эфемерного jobId транскрипции.
+  const fileHash = ref<string | null>(null)
   const result = ref<TranscriptionResult | null>(null)
   const error = ref<string | null>(null)
   const fileName = ref<string | null>(null)
@@ -58,6 +64,9 @@ export function useTranscription() {
   const isVideo = ref(false)
 
   let stopped = false
+  // Держим исходный файл, чтобы можно было распознать заново (кнопка) без
+  // повторного выбора файла пользователем.
+  let lastFile: File | null = null
 
   function revokeMedia() {
     if (mediaUrl.value) URL.revokeObjectURL(mediaUrl.value)
@@ -68,25 +77,71 @@ export function useTranscription() {
     () => status.value === 'uploading' || status.value === 'processing'
   )
 
+  // Готовим медиа (blob для плеера) под текущий файл.
+  function setMedia(file: File) {
+    revokeMedia()
+    fileName.value = file.name
+    mediaUrl.value = URL.createObjectURL(file)
+    isVideo.value = file.type.startsWith('video')
+  }
+
   function reset() {
     stopped = true
     status.value = 'idle'
     jobId.value = null
+    fileHash.value = null
     result.value = null
     error.value = null
     fileName.value = null
+    lastFile = null
     revokeMedia()
   }
 
-  async function transcribe(file: File) {
+  // Открыть файл из сохранённой структуры транскрипта — БЕЗ обращения к WhisperX.
+  // Так тайминги и разметка остаются ровно те же, что при сохранении.
+  function openSaved(file: File, hash: string, segments: SavedSegment[]) {
+    stopped = true // на всякий случай гасим возможный поллинг
+    lastFile = file
+    error.value = null
+    setMedia(file)
+    fileHash.value = hash
+    jobId.value = null
+    result.value = {
+      status: 'done',
+      segments: segments.map((s) => ({
+        speaker: s.speaker ?? undefined,
+        start: s.start ?? undefined,
+        words: s.words.map((w) => ({
+          word: w.text,
+          start: w.start ?? undefined,
+          end: w.end ?? undefined
+        }))
+      })),
+      text: segments
+        .map((s) => s.words.map((w) => w.text).join(' ').replace(/\s+/g, ' ').trim())
+        .filter(Boolean)
+        .join('\n')
+    }
+    status.value = 'done'
+  }
+
+  // Повторно распознать текущий файл через WhisperX (кнопка «Распознать заново»).
+  function retranscribe() {
+    if (lastFile) transcribe(lastFile)
+  }
+
+  async function transcribe(file: File, precomputedHash?: string) {
     stopped = false
+    lastFile = file
     error.value = null
     result.value = null
-    fileName.value = file.name
-    revokeMedia()
-    mediaUrl.value = URL.createObjectURL(file)
-    isVideo.value = file.type.startsWith('video')
+    setMedia(file)
     status.value = 'uploading'
+
+    // Ключ файла нужен для загрузки/сохранения разметки. Если хеш уже посчитан
+    // выше (при выборе файла) — берём его, иначе считаем параллельно.
+    if (precomputedHash) fileHash.value = precomputedHash
+    else sha256File(file).then((h) => (fileHash.value = h)).catch(() => {})
 
     try {
       const form = new FormData()
@@ -148,6 +203,7 @@ export function useTranscription() {
   return {
     status,
     jobId,
+    fileHash,
     result,
     error,
     fileName,
@@ -155,6 +211,8 @@ export function useTranscription() {
     isVideo,
     isBusy,
     transcribe,
+    openSaved,
+    retranscribe,
     reset
   }
 }
