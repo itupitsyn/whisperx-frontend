@@ -52,12 +52,23 @@ const edits = ref<Record<string, string>>({})
 // сама useAnnotations через add/remove/changeClass).
 watch(edits, () => (annosSaved.value = false), { deep: true })
 
+// Ручное переназначение спикеров: диаризация часто лепит всё в один SPEAKER_00
+// (например, если это один человек «разными голосами»), поэтому даём править
+// спикера посегментно. Ключ — тот же стабильный ключ сегмента (время начала),
+// значение — имя спикера ('' = спикер снят). Пустой оверрайд отличается от
+// «нет оверрайда» (undefined), поэтому храним '' явно.
+const speakerEdits = ref<Record<string, string>>({})
+watch(speakerEdits, () => (annosSaved.value = false), { deep: true })
+
 const dragging = ref(false)
 const fileInput = ref<HTMLInputElement | null>(null)
 
 // ---- проигрыватель ----
 const mediaEl = ref<HTMLMediaElement | null>(null)
 const currentTime = ref(0)
+// Верхняя граница воспроизведения: доиграв до неё, ставим на паузу. Нужна,
+// чтобы прослушивать выделенный фрагмент, а не «убегать» дальше по тексту.
+const playBound = ref<number | null>(null)
 
 // Скорость воспроизведения. Замедление помогает расслышать артефакты речи.
 // preservesPitch держим включённым, чтобы тон не «плыл» при 0.25–0.5×.
@@ -73,13 +84,37 @@ function applySpeed() {
 watch([speed, mediaEl], applySpeed)
 
 function onTimeUpdate() {
-  currentTime.value = mediaEl.value?.currentTime ?? 0
+  const el = mediaEl.value
+  currentTime.value = el?.currentTime ?? 0
+  // Дошли до конца выделенного фрагмента — останавливаемся.
+  if (playBound.value != null && el && el.currentTime >= playBound.value) {
+    el.pause()
+    playBound.value = null
+  }
 }
 
 function seek(t?: number) {
   if (t == null || !mediaEl.value) return
+  playBound.value = null // ручная перемотка снимает ограничение выделением
   mediaEl.value.currentTime = t
   mediaEl.value.play()
+}
+
+// Проиграть только диапазон [start, end] и остановиться на конце.
+function playRange(start?: number, end?: number) {
+  const el = mediaEl.value
+  if (!el || start == null || end == null || end <= start) return
+  el.currentTime = start
+  playBound.value = end
+  el.play()
+}
+
+function playMedia() {
+  playBound.value = null // обычное воспроизведение — без ограничения выделением
+  mediaEl.value?.play()
+}
+function pauseMedia() {
+  mediaEl.value?.pause()
 }
 
 // Одиночный клик/тап по слову — перемотка (откладываем), двойной — правка слова.
@@ -122,6 +157,7 @@ interface RSeg {
   key: number
   start?: number
   speaker?: string
+  speakerKey: string
   words: RWord[]
 }
 
@@ -141,7 +177,17 @@ const renderSegments = computed<RSeg[]>(() => {
     } else {
       words = [{ idx: idx++, text: seg.text ?? '', start: seg.start, end: seg.end }]
     }
-    return { key, start: words[0]?.start ?? seg.start, speaker: seg.speaker, words }
+    const start = words[0]?.start ?? seg.start
+    // Стабильный ключ сегмента для оверрайда спикера (как у правок слов — по времени).
+    const speakerKey = start != null ? start.toFixed(3) : `idx-${key}`
+    const override = speakerEdits.value[speakerKey]
+    return {
+      key,
+      start,
+      speakerKey,
+      speaker: override !== undefined ? override : seg.speaker,
+      words
+    }
   })
 })
 
@@ -156,19 +202,53 @@ const activeWordIdx = computed(() => {
   return -1
 })
 
-// idx слова -> цвет класса (для подсветки размеченного).
-// Привязка по СЕРЕДИНЕ слова: устойчива к сдвигу таймингов на несколько мс
-// (напр. после повторного распознавания) — подсветка не слетает.
-const wordColor = computed<Record<number, string>>(() => {
-  const map: Record<number, string> = {}
+// Слово разбиваем на «руны» — непрерывные отрезки символов с одним цветом
+// разметки (или без). Так подсветка ложится только на размеченную часть слова
+// (слог/букву), а не на слово целиком. Границы аннотации внутри слова находим
+// обратной интерполяцией времени в символы (у WhisperX тайминги пословные).
+interface WordRun {
+  text: string
+  color: string | null
+}
+const wordRunsMap = computed<Record<number, WordRun[]>>(() => {
+  const map: Record<number, WordRun[]> = {}
+  const textAnnos = annos.value.filter((an) => an.source === 'text')
   for (const s of renderSegments.value) {
     for (const w of s.words) {
-      if (w.start == null || w.end == null) continue
-      const mid = (w.start + w.end) / 2
-      const a = annos.value.find(
-        (an) => an.source === 'text' && mid >= an.start && mid <= an.end
-      )
-      if (a) map[w.idx] = classColor(a.cls)
+      const text = wordText(w)
+      const L = text.length
+      if (w.start == null || w.end == null || L === 0) {
+        map[w.idx] = [{ text, color: null }]
+        continue
+      }
+      const ws = w.start
+      const we = w.end
+      const denom = we - ws
+      const colors: (string | null)[] = new Array(L).fill(null)
+      for (const an of textAnnos) {
+        if (!(ws < an.end && we > an.start)) continue // не пересекается со словом
+        let c0 = denom > 0 ? Math.round(((an.start - ws) / denom) * L) : 0
+        let c1 = denom > 0 ? Math.round(((an.end - ws) / denom) * L) : L
+        c0 = Math.max(0, Math.min(L, c0))
+        c1 = Math.max(0, Math.min(L, c1))
+        if (c1 <= c0) {
+          // Слишком узкий диапазон — подсветим хотя бы один символ в пределах слова.
+          c0 = Math.min(c0, L - 1)
+          c1 = c0 + 1
+        }
+        const col = classColor(an.cls)
+        for (let i = c0; i < c1; i++) if (colors[i] == null) colors[i] = col
+      }
+      // Схлопываем соседние символы одного цвета в непрерывные руны.
+      const runs: WordRun[] = []
+      for (let i = 0; i < L; ) {
+        const col = colors[i]
+        let j = i + 1
+        while (j < L && colors[j] === col) j++
+        runs.push({ text: text.slice(i, j), color: col })
+        i = j
+      }
+      map[w.idx] = runs
     }
   }
   return map
@@ -221,7 +301,7 @@ const hasEdits = computed(() => Object.keys(edits.value).length > 0)
 // Структура транскрипта для сохранения: слова с таймингами и финальным текстом.
 function buildSegments(): SavedSegment[] {
   return renderSegments.value.map((s) => ({
-    speaker: s.speaker ?? null,
+    speaker: s.speaker || null,
     start: s.start ?? null,
     words: s.words.map((w) => ({
       text: wordText(w),
@@ -229,6 +309,59 @@ function buildSegments(): SavedSegment[] {
       end: w.end ?? null
     }))
   }))
+}
+
+// ---- пикер спикера (creatable select) ----
+const {
+  floating: spkEl,
+  open: spkOpen,
+  show: showSpk,
+  hide: hideSpk
+} = useFloatingMenu()
+const spkTargetKey = ref<string | null>(null)
+const spkInput = ref('')
+// Текущий спикер открытого сегмента — для подсветки активной опции.
+const spkCurrent = ref('')
+// Имена, которые пользователь создал в этой сессии. Держим отдельно от
+// назначенных на сегменты, чтобы созданное имя не исчезало из списка, если
+// его временно ни на одном сегменте нет (напр. переназначили сегмент дальше).
+const customSpeakers = ref<string[]>([])
+
+// Опции селекта: имена, назначенные на сегменты, ∪ созданные в сессии.
+const speakerOptions = computed(() => {
+  const set = new Set<string>()
+  for (const s of renderSegments.value) if (s.speaker) set.add(s.speaker)
+  for (const n of customSpeakers.value) set.add(n)
+  return [...set].sort()
+})
+// Показываем «Создать …», только если введённого имени ещё нет в списке.
+const canCreateSpeaker = computed(() => {
+  const v = spkInput.value.trim()
+  return !!v && !speakerOptions.value.includes(v)
+})
+
+function openSpeakerPicker(seg: RSeg, e: MouseEvent) {
+  spkTargetKey.value = seg.speakerKey
+  spkCurrent.value = seg.speaker ?? ''
+  // Предзаполняем текущим именем (v-focus его выделит — можно сразу перепечатать).
+  // Фильтрации по вводу нет, поэтому список спикеров всё равно виден целиком.
+  spkInput.value = seg.speaker ?? ''
+  showSpk(e.currentTarget as HTMLElement)
+}
+function applySpeaker(name: string) {
+  const key = spkTargetKey.value
+  if (key == null) return
+  const v = name.trim()
+  // Запоминаем созданное имя, чтобы оно осталось в списке селекта.
+  if (v && !customSpeakers.value.includes(v)) customSpeakers.value.push(v)
+  speakerEdits.value[key] = v
+  hideSpk()
+}
+function clearSpeaker() {
+  const key = spkTargetKey.value
+  if (key == null) return
+  speakerEdits.value[key] = ''
+  hideSpk()
 }
 
 // ---- меню классов (Floating UI): и создание, и переклассификация ----
@@ -267,9 +400,11 @@ function evaluateSelection() {
   const c = transcriptEl.value
   if (!c || !c.contains(range.commonAncestorContainer)) return
 
-  // Берём все слова, чей диапазон пересекается с выделением
-  // (containsNode не годится: часть одного слова им не ловится).
-  const chosen: HTMLElement[] = []
+  // Считаем тайминги с точностью до символа. У WhisperX тайминги только
+  // пословные, поэтому для частично выделенного слова (слог/буква) время
+  // интерполируем линейно по доле символов внутри слова. Для слов, выделенных
+  // целиком, границы совпадают с их start/end.
+  const times: number[] = []
   for (const el of Array.from(c.querySelectorAll<HTMLElement>('.word'))) {
     const wr = document.createRange()
     wr.selectNodeContents(el)
@@ -277,23 +412,39 @@ function evaluateSelection() {
       range.compareBoundaryPoints(Range.END_TO_START, wr) < 0 &&
       range.compareBoundaryPoints(Range.START_TO_END, wr) > 0
     wr.detach()
-    if (overlaps) chosen.push(el)
+    if (!overlaps) continue
+
+    const ws = parseFloat(el.dataset.start ?? '')
+    const we = parseFloat(el.dataset.end ?? '')
+    if (isNaN(ws) || isNaN(we)) continue
+
+    // Длина без хвостового пробела (в спане текст «слово »).
+    const L = (el.textContent ?? '').trimEnd().length
+    // Символьное смещение границы выделения от начала слова. Считаем через
+    // Range.toString(), поэтому устойчиво к вложенным span-«рунам» внутри слова.
+    // null — граница вне слова (тогда: начало → 0, конец → L, слово задето целиком).
+    const boundaryChar = (node: Node, off: number): number | null => {
+      if (!(el === node || el.contains(node))) return null
+      const rr = document.createRange()
+      rr.selectNodeContents(el)
+      try {
+        rr.setEnd(node, off)
+      } catch {
+        return null
+      }
+      return Math.min(rr.toString().length, L)
+    }
+    const a = boundaryChar(range.startContainer, range.startOffset) ?? 0
+    const b = boundaryChar(range.endContainer, range.endOffset) ?? L
+    const at = (ch: number) => (L > 0 ? ws + (ch / L) * (we - ws) : ws)
+    times.push(at(a), at(b))
   }
-  const starts = chosen
-    .map((el) => parseFloat(el.dataset.start ?? ''))
-    .filter((n) => !isNaN(n))
-  const ends = chosen
-    .map((el) => parseFloat(el.dataset.end ?? ''))
-    .filter((n) => !isNaN(n))
-  if (!starts.length || !ends.length) return
+  if (!times.length) return
 
   pending.value = {
-    start: Math.min(...starts),
-    end: Math.max(...ends),
-    text: chosen
-      .map((el) => el.textContent?.trim())
-      .filter(Boolean)
-      .join(' ')
+    start: Math.min(...times),
+    end: Math.max(...times),
+    text: sel.toString().trim()
   }
   pickerMode.value = 'text'
   pickCtx.value = { kind: 'create' }
@@ -322,15 +473,26 @@ function applyClass(cls: string) {
   hidePicker()
 }
 
+// Прослушать текущее выделение (меню не закрываем — можно переслушать/разметить).
+function playSelection() {
+  if (pending.value) playRange(pending.value.start, pending.value.end)
+}
+
 // Разметка артефакта прямо на аудиодорожке (вдох/щелчок/спазм)
 function onAudioAdd(a: { start: number; end: number; cls: string }) {
   addAnno({ start: a.start, end: a.end, text: '', cls: a.cls, source: 'audio' })
 }
 
 function onDocMouseDown(e: MouseEvent) {
-  if (!pickerOpen.value) return
-  const f = pickerEl.value
-  if (f && !f.contains(e.target as Node)) hidePicker()
+  const t = e.target as Node
+  if (pickerOpen.value) {
+    const f = pickerEl.value
+    if (f && !f.contains(t)) hidePicker()
+  }
+  if (spkOpen.value) {
+    const f = spkEl.value
+    if (f && !f.contains(t)) hideSpk()
+  }
 }
 
 onMounted(() => {
@@ -351,7 +513,9 @@ function pick() {
 // тайминги и разметка сохраняются). Иначе — распознаём заново.
 async function openFile(file: File) {
   edits.value = {}
+  speakerEdits.value = {}
   editingKey.value = null
+  customSpeakers.value = []
   const hash = await sha256File(file)
   const { segments } = await loadAnnos(hash) // заодно ставит разметку
   if (segments.length) openSaved(file, hash, segments)
@@ -378,6 +542,8 @@ function reRecognize() {
   )
     return
   edits.value = {}
+  speakerEdits.value = {}
+  customSpeakers.value = []
   editingKey.value = null
   retranscribe()
 }
@@ -395,6 +561,8 @@ function doSave() {
 function newFile() {
   clearAnnos()
   edits.value = {}
+  speakerEdits.value = {}
+  customSpeakers.value = []
   editingKey.value = null
   reset()
 }
@@ -532,6 +700,9 @@ function fmt(t?: number) {
           @timeupdate="onTimeUpdate"
         />
         <div class="speed">
+          <button class="speed-btn" title="Воспроизвести" @click="playMedia">▶</button>
+          <button class="speed-btn" title="Пауза" @click="pauseMedia">⏸</button>
+          <span class="speed-divider" />
           <span class="speed-label">Скорость</span>
           <button
             v-for="s in SPEEDS"
@@ -552,6 +723,7 @@ function fmt(t?: number) {
         :annos="annos"
         @add="onAudioAdd"
         @remove="removeAnno"
+        @play="playRange($event.start, $event.end)"
       />
 
       <template v-if="renderSegments.length">
@@ -562,7 +734,12 @@ function fmt(t?: number) {
         <div ref="transcriptEl" class="segments">
           <div v-for="seg in renderSegments" :key="seg.key" class="segment">
             <span class="time" @click="seek(seg.start)">{{ fmt(seg.start) }}</span>
-            <span v-if="seg.speaker" class="speaker">{{ seg.speaker }}</span>
+            <button
+              class="speaker"
+              :class="{ 'speaker-empty': !seg.speaker }"
+              title="Изменить спикера"
+              @click="openSpeakerPicker(seg, $event)"
+            >{{ seg.speaker || '＋' }}</button>
             <span class="words">
               <template v-for="w in seg.words" :key="w.idx">
                 <input
@@ -581,14 +758,19 @@ function fmt(t?: number) {
                   class="word"
                   :class="{
                     active: w.idx === activeWordIdx,
-                    annotated: !!wordColor[w.idx],
                     edited: isEdited(w)
                   }"
                   :data-start="w.start"
                   :data-end="w.end"
-                  :style="wordColor[w.idx] ? { borderBottomColor: wordColor[w.idx] } : undefined"
                   @click="onWordClick(w)"
-                  >{{ wordText(w) + ' ' }}</span
+                  ><span
+                    v-for="(run, ri) in wordRunsMap[w.idx]"
+                    :key="ri"
+                    class="run"
+                    :class="{ 'run-annotated': !!run.color }"
+                    :style="run.color ? { borderBottomColor: run.color } : undefined"
+                    >{{ run.text }}</span
+                  >{{ ' ' }}</span
                 >
               </template>
             </span>
@@ -629,6 +811,14 @@ function fmt(t?: number) {
       class="ctx-menu"
       @mousedown.prevent.stop
     >
+      <button
+        v-if="pickCtx.kind === 'create' && pending"
+        class="ctx-item ctx-play"
+        @click="playSelection()"
+      >
+        <span class="ctx-play-icon">▶</span>
+        <span class="ctx-label">Прослушать выделенное</span>
+      </button>
       <template v-for="g in pickerGroups" :key="g.group">
         <div class="ctx-group">{{ g.group }}</div>
         <button
@@ -645,6 +835,40 @@ function fmt(t?: number) {
           </span>
         </button>
       </template>
+    </div>
+
+    <!-- Пикер спикера (creatable select), позиционируется через Floating UI -->
+    <div v-if="spkOpen" ref="spkEl" class="ctx-menu spk-menu">
+      <input
+        v-model="spkInput"
+        v-focus
+        class="spk-input"
+        placeholder="Имя спикера…"
+        @keydown.enter.prevent="applySpeaker(spkInput)"
+        @keydown.esc.prevent="hideSpk()"
+      />
+      <div class="spk-list">
+        <button
+          v-for="opt in speakerOptions"
+          :key="opt"
+          class="ctx-item spk-item"
+          :class="{ 'spk-active': opt === spkCurrent }"
+          @click="applySpeaker(opt)"
+        >
+          <span class="spk-check">{{ opt === spkCurrent ? '✓' : '' }}</span>
+          {{ opt }}
+        </button>
+        <button
+          v-if="canCreateSpeaker"
+          class="ctx-item spk-item spk-create"
+          @click="applySpeaker(spkInput)"
+        >
+          ＋ Создать «{{ spkInput.trim() }}»
+        </button>
+        <button class="ctx-item spk-item spk-clear" @click="clearSpeaker()">
+          Убрать спикера
+        </button>
+      </div>
     </div>
   </div>
 </template>
@@ -763,6 +987,12 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   color: var(--muted);
   margin-right: 4px;
 }
+.speed-divider {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  margin: 0 4px;
+}
 .speed-btn {
   background: transparent;
   border: 1px solid var(--border);
@@ -807,6 +1037,56 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   font-size: 12px;
   font-weight: 600;
   white-space: nowrap;
+  font-family: inherit;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 1px 6px;
+  cursor: pointer;
+  transition: 0.12s;
+}
+.speaker:hover {
+  border-color: var(--accent);
+  background: #1d2030;
+}
+.speaker-empty {
+  color: var(--muted);
+  font-weight: 400;
+  opacity: 0.55;
+}
+.speaker-empty:hover { opacity: 1; }
+
+.spk-menu { width: 240px; }
+.spk-input {
+  font: inherit;
+  color: var(--text);
+  background: #14161d;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  width: 100%;
+}
+.spk-list { display: flex; flex-direction: column; gap: 2px; }
+.spk-item {
+  align-items: center;
+  font-size: 14px;
+  font-weight: 600;
+}
+.spk-check {
+  width: 12px;
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 12px;
+}
+.spk-active { color: var(--accent); }
+.spk-create { color: var(--accent); }
+.spk-clear {
+  color: var(--muted);
+  font-weight: 400;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  margin-top: 4px;
 }
 .words {
   line-height: 1.7;
@@ -816,7 +1096,6 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
 }
 .word {
   cursor: pointer;
-  border-bottom: 2px solid transparent;
   transition: background 0.1s;
   /* убирает зум по двойному тапу и 300мс-задержку клика на мобилке */
   touch-action: manipulation;
@@ -826,8 +1105,11 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   background: #2a3350;
   color: #fff;
 }
-.word.annotated { border-bottom-style: solid; }
 .word.edited { color: #ffd166; }
+/* Подсветка размеченной части слова живёт на «руне», а не на всём слове,
+   чтобы можно было подчеркнуть отдельный слог/букву. */
+.run { border-bottom: 2px solid transparent; }
+.run-annotated { border-bottom-style: solid; }
 .word-input {
   font: inherit;
   color: #fff;
@@ -941,6 +1223,16 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
 .ctx-text { display: flex; flex-direction: column; gap: 2px; }
 .ctx-label { font-size: 14px; font-weight: 600; }
 .ctx-desc { font-size: 12px; color: var(--muted); line-height: 1.35; }
+.ctx-play {
+  align-items: center;
+  color: var(--accent);
+  font-weight: 600;
+  width: 100%;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin-bottom: 4px;
+}
+.ctx-play-icon { flex: 0 0 auto; font-size: 11px; }
 
 .btn {
   background: var(--accent);

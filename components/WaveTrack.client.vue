@@ -19,6 +19,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   (e: 'add', a: { start: number; end: number; cls: string }): void
   (e: 'remove', index: number): void
+  (e: 'play', range: { start: number; end: number }): void
 }>()
 
 const container = ref<HTMLElement | null>(null)
@@ -117,6 +118,12 @@ function cancelPending() {
   hideMenu()
 }
 
+// Прослушать выделенный участок дорожки в его пределах (родитель ограничит
+// воспроизведение концом диапазона). Меню оставляем открытым.
+function playPending() {
+  if (pending) emit('play', { start: pending.start, end: pending.end })
+}
+
 // Пересобираем регионы сохранённой аудио-разметки из props
 function renderAnnoRegions() {
   if (!regions || !ready) return
@@ -185,6 +192,10 @@ onBeforeUnmount(() => {
 
     <!-- Меню аудио-эффектов (позиционируется через Floating UI) -->
     <div v-if="menuOpen" ref="menuEl" class="wt-menu" @mousedown.prevent.stop>
+      <button class="wt-item wt-play" @click="playPending">
+        <span class="wt-play-icon">▶</span>
+        <span class="wt-label">Прослушать выделенное</span>
+      </button>
       <div class="wt-menu-head">Аудио-эффект</div>
       <button
         v-for="c in effects"
@@ -297,6 +308,15 @@ onBeforeUnmount(() => {
   color: var(--muted);
   line-height: 1.35;
 }
+.wt-play {
+  align-items: center;
+  color: var(--accent);
+  font-weight: 600;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin-bottom: 4px;
+}
+.wt-play-icon { flex: 0 0 auto; font-size: 11px; }
 .wt-cancel {
   background: none;
   border: none;
