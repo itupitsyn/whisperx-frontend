@@ -2,7 +2,7 @@
 import type { Segment } from '~/composables/useTranscription'
 import type { SavedSegment } from '~/composables/useAnnotations'
 import { sha256File } from '~/utils/fileHash'
-import { SPEECH_GROUPS, AUDIO_EFFECTS, classMeta } from '~/utils/speechClasses'
+import { ALL_GROUPS, classMeta } from '~/utils/speechClasses'
 
 // Автофокус для инлайн-редактора слова
 const vFocus = {
@@ -96,8 +96,38 @@ function onTimeUpdate() {
 function seek(t?: number) {
   if (t == null || !mediaEl.value) return
   playBound.value = null // ручная перемотка снимает ограничение выделением
+  stopBoundWatch()
   mediaEl.value.currentTime = t
   mediaEl.value.play()
+}
+
+// Слежение за верхней границей через requestAnimationFrame (~60 Гц). Событие
+// timeupdate тикает лишь ~4 раза в секунду и проскакивает конец слова на ~250мс
+// (заезжает в следующее) — rAF даёт точность ~16мс.
+let boundRaf: number | null = null
+function stopBoundWatch() {
+  if (boundRaf != null) {
+    cancelAnimationFrame(boundRaf)
+    boundRaf = null
+  }
+}
+function boundTick() {
+  const el = mediaEl.value
+  if (playBound.value == null || !el || el.paused || el.ended) {
+    boundRaf = null
+    return
+  }
+  if (el.currentTime >= playBound.value) {
+    el.pause()
+    playBound.value = null
+    boundRaf = null
+    return
+  }
+  boundRaf = requestAnimationFrame(boundTick)
+}
+function startBoundWatch() {
+  stopBoundWatch()
+  boundRaf = requestAnimationFrame(boundTick)
 }
 
 // Проиграть только диапазон [start, end] и остановиться на конце.
@@ -107,10 +137,18 @@ function playRange(start?: number, end?: number) {
   el.currentTime = start
   playBound.value = end
   el.play()
+  startBoundWatch()
+}
+
+// Возобновление воспроизведения (в т.ч. нативной кнопкой) — если ограничение
+// ещё активно, поднимаем точный watch заново.
+function onMediaPlay() {
+  if (playBound.value != null) startBoundWatch()
 }
 
 function playMedia() {
   playBound.value = null // обычное воспроизведение — без ограничения выделением
+  stopBoundWatch()
   mediaEl.value?.play()
 }
 function pauseMedia() {
@@ -140,12 +178,34 @@ function onWordClick(w: RWord) {
   if (clickTimer) clearTimeout(clickTimer)
   clickTimer = setTimeout(() => {
     clickTimer = null
-    seek(w.start)
+    // Клик по слову проигрывает только его и останавливается на конце слова.
+    // Если у слова нет конца — обычная перемотка (играет дальше).
+    if (w.end != null) playRange(w.start, w.end)
+    else seek(w.start)
   }, TAP_MS)
 }
 
 // ---- транскрипт по словам ----
 const segments = computed<Segment[]>(() => result.value?.segments ?? [])
+
+// Спан сегмента по времени: от начала первого слова до конца последнего.
+function segSpan(s: Segment): { st: number; en: number } {
+  const st = s.words?.[0]?.start ?? s.start ?? 0
+  const last = s.words?.length ? s.words[s.words.length - 1] : undefined
+  const en = last?.end ?? last?.start ?? s.end ?? st
+  return { st, en }
+}
+// Спаны всех слов — для валидации вставки текста с дорожки (передаём в
+// WaveTrack). Ошибку показываем, если регион задевает больше одного слова.
+const wordSpans = computed<{ start: number; end: number }[]>(() => {
+  const out: { start: number; end: number }[] = []
+  for (const s of segments.value) {
+    for (const w of s.words ?? []) {
+      if (w.start != null && w.end != null) out.push({ start: w.start, end: w.end })
+    }
+  }
+  return out
+})
 
 interface RWord {
   idx: number
@@ -372,16 +432,12 @@ const {
   show: showPicker,
   hide: hidePicker
 } = useFloatingMenu()
-const pickerMode = ref<'text' | 'audio'>('text')
 type PickCtx = { kind: 'create' } | { kind: 'edit'; index: number }
 const pickCtx = ref<PickCtx>({ kind: 'create' })
 const pending = ref<{ start: number; end: number; text: string } | null>(null)
 
-const pickerGroups = computed(() =>
-  pickerMode.value === 'text'
-    ? SPEECH_GROUPS
-    : [{ group: 'Аудио', items: AUDIO_EFFECTS }]
-)
+// И текст, и аудиодорожка выбирают нарушение из одного общего списка.
+const pickerGroups = ALL_GROUPS
 
 // Реакция на изменение выделения. Слушаем document `selectionchange` (с
 // дебаунсом) вместо mouseup — так работает и мышью на десктопе, и выделением
@@ -446,7 +502,6 @@ function evaluateSelection() {
     end: Math.max(...times),
     text: sel.toString().trim()
   }
-  pickerMode.value = 'text'
   pickCtx.value = { kind: 'create' }
   // Виртуальный якорь считает rect выделения «вживую» — меню следует за скроллом.
   showPicker({ getBoundingClientRect: () => range.getBoundingClientRect() })
@@ -456,7 +511,6 @@ function evaluateSelection() {
 function editAnnoClass(index: number, anchor: HTMLElement) {
   const a = annos.value[index]
   if (!a) return
-  pickerMode.value = a.source === 'audio' ? 'audio' : 'text'
   pickCtx.value = { kind: 'edit', index }
   showPicker(anchor)
 }
@@ -483,6 +537,58 @@ function onAudioAdd(a: { start: number; end: number; cls: string }) {
   addAnno({ start: a.start, end: a.end, text: '', cls: a.cls, source: 'audio' })
 }
 
+// Вставка транскрипции с дорожки: новое слово попадает в текст транскрипта на
+// нужное по времени место, класс вешается разметкой (подсветит слово).
+// Существующие слова не трогаем; при пересечении >1 сегмента WaveTrack не даёт
+// сюда дойти (валидирует заранее), но подстрахуемся и здесь.
+function onAudioTranscribe(a: {
+  start: number
+  end: number
+  cls: string
+  text: string
+}) {
+  const res = result.value
+  if (!res?.segments) return
+
+  // Работаем с копией, затем переприсваиваем result — гарантированная реактивность.
+  const segs: Segment[] = res.segments.map((s) => ({
+    ...s,
+    words: s.words ? [...s.words] : []
+  }))
+
+  // Ищем сегмент с наибольшим пересечением по времени (ошибку про >1 слово уже
+  // отсеял WaveTrack). Если пересечений нет — регион в тишине, новый сегмент.
+  let target = -1
+  let best = 0
+  segs.forEach((s, i) => {
+    const { st, en } = segSpan(s)
+    const ov = Math.min(a.end, en) - Math.max(a.start, st)
+    if (ov > best) {
+      best = ov
+      target = i
+    }
+  })
+
+  const newWord = { word: a.text, start: a.start, end: a.end }
+  if (target >= 0) {
+    // Вставляем слово в сегмент по возрастанию времени начала.
+    const words = segs[target].words!
+    const idx = words.findIndex((w) => (w.start ?? 0) > a.start)
+    if (idx === -1) words.push(newWord)
+    else words.splice(idx, 0, newWord)
+  } else {
+    // Регион в тишине между сегментами — новый сегмент на нужном месте.
+    const newSeg: Segment = { start: a.start, words: [newWord] }
+    const idx = segs.findIndex((s) => segSpan(s).st > a.start)
+    if (idx === -1) segs.push(newSeg)
+    else segs.splice(idx, 0, newSeg)
+  }
+
+  result.value = { ...res, segments: segs }
+  // Класс — текстовой разметкой: подсветит вставленное слово и попадёт в панель.
+  addAnno({ start: a.start, end: a.end, text: a.text, cls: a.cls, source: 'text' })
+}
+
 function onDocMouseDown(e: MouseEvent) {
   const t = e.target as Node
   if (pickerOpen.value) {
@@ -502,6 +608,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocMouseDown)
   document.removeEventListener('selectionchange', onSelectionChange)
+  stopBoundWatch()
 })
 
 // ---- загрузка файла ----
@@ -691,6 +798,7 @@ function fmt(t?: number) {
           :src="mediaUrl"
           controls
           @timeupdate="onTimeUpdate"
+          @play="onMediaPlay"
         />
         <audio
           v-else
@@ -698,6 +806,7 @@ function fmt(t?: number) {
           :src="mediaUrl"
           controls
           @timeupdate="onTimeUpdate"
+          @play="onMediaPlay"
         />
         <div class="speed">
           <button class="speed-btn" title="Воспроизвести" @click="playMedia">▶</button>
@@ -721,15 +830,17 @@ function fmt(t?: number) {
         :url="mediaUrl"
         :media="mediaEl"
         :annos="annos"
+        :words="wordSpans"
         @add="onAudioAdd"
         @remove="removeAnno"
         @play="playRange($event.start, $event.end)"
+        @transcribe="onAudioTranscribe"
       />
 
       <template v-if="renderSegments.length">
         <p class="mark-hint">
           Выделите текст → выберите класс нарушения. Тап/клик по слову —
-          перемотка, двойной тап/клик — исправить слово.
+          проиграть его, двойной тап/клик — исправить слово.
         </p>
         <div ref="transcriptEl" class="segments">
           <div v-for="seg in renderSegments" :key="seg.key" class="segment">
@@ -1196,7 +1307,7 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   display: flex;
   flex-direction: column;
   width: 320px;
-  max-height: 60vh;
+  max-height: 48vh;
   overflow-y: auto;
 }
 .ctx-group {
@@ -1204,25 +1315,36 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--muted);
-  padding: 8px 10px 4px;
+  padding: 6px 10px 2px;
 }
 .ctx-item {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 8px;
   background: none;
   border: none;
   color: var(--text);
-  padding: 8px 10px;
+  padding: 5px 10px;
   border-radius: 6px;
   cursor: pointer;
   text-align: left;
 }
 .ctx-item:hover { background: #2a3350; }
 .ctx-item .dot { margin-top: 4px; flex: 0 0 auto; }
-.ctx-text { display: flex; flex-direction: column; gap: 2px; }
-.ctx-label { font-size: 14px; font-weight: 600; }
-.ctx-desc { font-size: 12px; color: var(--muted); line-height: 1.35; }
+.ctx-text { display: flex; flex-direction: column; gap: 1px; }
+.ctx-label { font-size: 13px; font-weight: 600; }
+/* Описание — подсказка: не больше 2 строк, дальше многоточие; полный текст
+   остаётся в нативном тултипе (title). Это заметно снижает высоту меню. */
+.ctx-desc {
+  font-size: 11px;
+  color: var(--muted);
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .ctx-play {
   align-items: center;
   color: var(--accent);

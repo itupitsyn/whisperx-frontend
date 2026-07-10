@@ -3,7 +3,7 @@ import WaveSurfer from 'wavesurfer.js'
 import RegionsPlugin, { type Region } from 'wavesurfer.js/plugins/regions'
 import TimelinePlugin from 'wavesurfer.js/plugins/timeline'
 import HoverPlugin from 'wavesurfer.js/plugins/hover'
-import { AUDIO_EFFECTS } from '~/utils/speechClasses'
+import { ALL_GROUPS, classMeta } from '~/utils/speechClasses'
 import type { Annotation } from '~/composables/useAnnotations'
 
 // Волновая дорожка для разметки аудио-артефактов (вдох/щелчок/спазм),
@@ -14,12 +14,19 @@ const props = defineProps<{
   url: string
   media: HTMLMediaElement | null
   annos: Annotation[]
+  // Спаны всех слов транскрипта по времени — для валидации вставки текста
+  // (ошибка, если регион задевает больше одного слова).
+  words?: { start: number; end: number }[]
 }>()
 
 const emit = defineEmits<{
   (e: 'add', a: { start: number; end: number; cls: string }): void
   (e: 'remove', index: number): void
   (e: 'play', range: { start: number; end: number }): void
+  (
+    e: 'transcribe',
+    a: { start: number; end: number; cls: string; text: string }
+  ): void
 }>()
 
 const container = ref<HTMLElement | null>(null)
@@ -36,10 +43,14 @@ const {
   show: showMenu,
   hide: hideMenu
 } = useFloatingMenu()
-const effects = AUDIO_EFFECTS
+const groups = ALL_GROUPS
+
+// Текст транскрипции для вставки в текст (необязательный) и ошибка валидации.
+const insertText = ref('')
+const menuError = ref('')
 
 function colorFor(cls: string): string {
-  return AUDIO_EFFECTS.find((e) => e.id === cls)?.color ?? '#8b90a0'
+  return classMeta(cls)?.color ?? '#8b90a0'
 }
 
 // hex (#rrggbb) -> rgba со своей прозрачностью
@@ -84,6 +95,8 @@ function init() {
     // отменяем предыдущий незавершённый выбор
     if (pending && pending !== region) pending.remove()
     pending = region
+    insertText.value = ''
+    menuError.value = ''
     if (region.element) showMenu(region.element)
   })
 
@@ -102,11 +115,31 @@ function init() {
 }
 
 function pick(cls: string) {
-  if (pending) {
+  if (!pending) return
+  const text = insertText.value.trim()
+  if (text) {
+    // Вставка текста в транскрипт: регион не должен задевать больше одного
+    // слова — иначе непонятно, куда вставлять.
+    const hit = (props.words ?? []).filter(
+      (w) => pending!.start < w.end && pending!.end > w.start
+    ).length
+    if (hit > 1) {
+      menuError.value = 'Выделение задевает несколько слов — сузьте его.'
+      return // регион и меню оставляем, чтобы можно было поправить
+    }
+    emit('transcribe', {
+      start: pending.start,
+      end: pending.end,
+      cls,
+      text
+    })
+  } else {
     emit('add', { start: pending.start, end: pending.end, cls })
-    pending.remove() // родитель добавит его как постоянный регион через props
-    pending = null
   }
+  pending.remove() // родитель добавит постоянную метку через props
+  pending = null
+  insertText.value = ''
+  menuError.value = ''
   hideMenu()
 }
 
@@ -115,6 +148,8 @@ function cancelPending() {
     pending.remove()
     pending = null
   }
+  insertText.value = ''
+  menuError.value = ''
   hideMenu()
 }
 
@@ -181,7 +216,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="wt">
     <div class="wt-bar">
-      <span class="wt-hint">Выдели участок дорожки → выбери аудио-эффект. 2× клик по метке — удалить.</span>
+      <span class="wt-hint">Выдели участок дорожки → выбери нарушение. 2× клик по метке — удалить.</span>
       <label class="wt-zoom">
         Зум
         <input type="range" min="20" max="400" step="10" v-model.number="zoom" />
@@ -196,20 +231,31 @@ onBeforeUnmount(() => {
         <span class="wt-play-icon">▶</span>
         <span class="wt-label">Прослушать выделенное</span>
       </button>
-      <div class="wt-menu-head">Аудио-эффект</div>
-      <button
-        v-for="c in effects"
-        :key="c.id"
-        class="wt-item"
-        :title="c.description"
-        @click="pick(c.id)"
-      >
-        <span class="wt-dot" :style="{ background: c.color }" />
-        <span class="wt-text">
-          <span class="wt-label">{{ c.label }}</span>
-          <span v-if="c.description" class="wt-desc">{{ c.description }}</span>
-        </span>
-      </button>
+      <input
+        v-model="insertText"
+        class="wt-text-input"
+        placeholder="Транскрипция (необязательно)…"
+        @mousedown.stop
+        @mouseup.stop
+        @click.stop
+      />
+      <p v-if="menuError" class="wt-error">{{ menuError }}</p>
+      <template v-for="g in groups" :key="g.group">
+        <div class="wt-menu-head">{{ g.group }}</div>
+        <button
+          v-for="c in g.items"
+          :key="c.id"
+          class="wt-item"
+          :title="c.description"
+          @click="pick(c.id)"
+        >
+          <span class="wt-dot" :style="{ background: c.color }" />
+          <span class="wt-text">
+            <span class="wt-label">{{ c.label }}</span>
+            <span v-if="c.description" class="wt-desc">{{ c.description }}</span>
+          </span>
+        </button>
+      </template>
       <button class="wt-cancel" @click="cancelPending">Отмена</button>
     </div>
   </div>
@@ -262,7 +308,7 @@ onBeforeUnmount(() => {
   display: flex;
   flex-direction: column;
   width: 300px;
-  max-height: 60vh;
+  max-height: 48vh;
   overflow-y: auto;
 }
 .wt-menu-head {
@@ -270,16 +316,16 @@ onBeforeUnmount(() => {
   text-transform: uppercase;
   letter-spacing: 0.5px;
   color: var(--muted);
-  padding: 8px 10px 4px;
+  padding: 6px 10px 2px;
 }
 .wt-item {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 8px;
   background: none;
   border: none;
   color: var(--text);
-  padding: 8px 10px;
+  padding: 5px 10px;
   border-radius: 6px;
   cursor: pointer;
   text-align: left;
@@ -297,16 +343,22 @@ onBeforeUnmount(() => {
 .wt-text {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 .wt-label {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
 }
+/* Описание — подсказка: максимум 2 строки, полный текст в тултипе (title). */
 .wt-desc {
-  font-size: 12px;
+  font-size: 11px;
   color: var(--muted);
-  line-height: 1.35;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .wt-play {
   align-items: center;
@@ -317,6 +369,23 @@ onBeforeUnmount(() => {
   margin-bottom: 4px;
 }
 .wt-play-icon { flex: 0 0 auto; font-size: 11px; }
+.wt-text-input {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: #14161d;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  width: 100%;
+}
+.wt-error {
+  margin: 2px 4px 6px;
+  font-size: 12px;
+  color: var(--error);
+  line-height: 1.3;
+}
 .wt-cancel {
   background: none;
   border: none;

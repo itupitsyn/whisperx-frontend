@@ -134,6 +134,14 @@ export const SPEECH_GROUPS: SpeechGroup[] = SPEECH_CLASSES.reduce(
   [] as SpeechGroup[]
 )
 
+// Объединённый список для меню: речевые классы + аудио-эффекты одним набором.
+// Используется и при разметке текста, и при разметке аудиодорожки — выбор
+// нарушения в обоих местах идёт из общего списка.
+export const ALL_GROUPS: SpeechGroup[] = [
+  ...SPEECH_GROUPS,
+  { group: 'Аудио', items: AUDIO_EFFECTS }
+]
+
 // Единый поиск меты по любому классу (текстовому или аудио).
 export function classMeta(id: string): SpeechClassMeta | undefined {
   return (
