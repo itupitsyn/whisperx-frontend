@@ -439,6 +439,13 @@ const pending = ref<{ start: number; end: number; text: string } | null>(null)
 // И текст, и аудиодорожка выбирают нарушение из одного общего списка.
 const pickerGroups = ALL_GROUPS
 
+// Имя нового спикера, вводимое прямо в меню выделения (создать и сразу назначить).
+const selSpkInput = ref('')
+const canCreateSelSpeaker = computed(() => {
+  const v = selSpkInput.value.trim()
+  return !!v && !speakerOptions.value.includes(v)
+})
+
 // Реакция на изменение выделения. Слушаем document `selectionchange` (с
 // дебаунсом) вместо mouseup — так работает и мышью на десктопе, и выделением
 // пальцем на мобилке (где mouseup при выделении через лупу/маркеры не приходит).
@@ -503,6 +510,7 @@ function evaluateSelection() {
     text: sel.toString().trim()
   }
   pickCtx.value = { kind: 'create' }
+  selSpkInput.value = ''
   // Виртуальный якорь считает rect выделения «вживую» — меню следует за скроллом.
   showPicker({ getBoundingClientRect: () => range.getBoundingClientRect() })
 }
@@ -530,6 +538,94 @@ function applyClass(cls: string) {
 // Прослушать текущее выделение (меню не закрываем — можно переслушать/разметить).
 function playSelection() {
   if (pending.value) playRange(pending.value.start, pending.value.end)
+}
+
+// ---- смена спикера у выделенного фрагмента ----
+// Спикер — свойство сегмента целиком, поэтому чтобы поменять его у произвольного
+// куска текста, сегмент приходится разбивать по границам выделения.
+
+// Слова, попавшие в выделение [start, end]. Слово считаем выделенным, если
+// диапазон покрывает хотя бы половину его длительности (частичное касание края
+// не тащит лишнее слово). Если по этому правилу не попало ни одно слово (напр.
+// выделен слог) — берём одно слово с наибольшим перекрытием, чтобы действие
+// всегда что-то делало. Возвращаем сквозные idx слов (как в renderSegments).
+function selectedWordIdxs(start: number, end: number): Set<number> {
+  const sel = new Set<number>()
+  let best = { idx: -1, ov: 0 }
+  for (const s of renderSegments.value) {
+    for (const w of s.words) {
+      if (w.start == null) continue
+      const we = w.end ?? w.start
+      const dur = we - w.start
+      const ov = Math.min(end, we) - Math.max(start, w.start)
+      if (ov <= 0) continue
+      if (ov > best.ov) best = { idx: w.idx, ov }
+      if (dur <= 0 || ov / dur >= 0.5) sel.add(w.idx)
+    }
+  }
+  if (!sel.size && best.idx >= 0) sel.add(best.idx)
+  return sel
+}
+
+// Назначить выделенному фрагменту спикера name (из числа текущих). Разбиваем
+// затронутые сегменты на непрерывные отрезки [до | выделенное | после]:
+// выделенному отрезку — новый спикер, остальным — прежний эффективный.
+// Эффективного спикера (оверрайд speakerEdits ∪ seg.speaker) запекаем во все
+// сегменты сразу, после чего speakerEdits можно очистить целиком — ключи по
+// времени старта всё равно поехали из-за разбиения.
+function changeSpeakerForSelection(name: string) {
+  const p = pending.value
+  const res = result.value
+  if (!p || !res?.segments) {
+    hidePicker()
+    return
+  }
+  const newSpk = name.trim()
+  const sel = selectedWordIdxs(p.start, p.end)
+  const rsegs = renderSegments.value
+  const out: Segment[] = []
+  let changed = false
+
+  res.segments.forEach((seg, i) => {
+    const rseg = rsegs[i]
+    const eff = rseg?.speaker
+    const words = seg.words ?? []
+    if (!words.length || !rseg) {
+      out.push({ ...seg, speaker: eff || undefined })
+      return
+    }
+    const flags = words.map((_, wi) => sel.has(rseg.words[wi].idx))
+    if (!flags.some(Boolean)) {
+      out.push({ ...seg, speaker: eff || undefined })
+      return
+    }
+    changed = true
+    // Режем на непрерывные отрезки одинакового флага выделения.
+    let from = 0
+    for (let wi = 1; wi <= words.length; wi++) {
+      if (wi === words.length || flags[wi] !== flags[from]) {
+        const slice = words.slice(from, wi)
+        out.push({
+          ...seg,
+          start: slice[0].start ?? seg.start,
+          speaker: (flags[from] ? newSpk : eff) || undefined,
+          words: slice
+        })
+        from = wi
+      }
+    }
+  })
+
+  if (changed) {
+    if (newSpk && !customSpeakers.value.includes(newSpk)) customSpeakers.value.push(newSpk)
+    result.value = { ...res, segments: out }
+    speakerEdits.value = {}
+    annosSaved.value = false
+  }
+  window.getSelection()?.removeAllRanges()
+  pending.value = null
+  selSpkInput.value = ''
+  hidePicker()
 }
 
 // Разметка артефакта прямо на аудиодорожке (вдох/щелчок/спазм)
@@ -930,6 +1026,35 @@ function fmt(t?: number) {
         <span class="ctx-play-icon">▶</span>
         <span class="ctx-label">Прослушать выделенное</span>
       </button>
+      <div v-if="pickCtx.kind === 'create' && pending" class="ctx-spk">
+        <div class="ctx-group">Сменить спикера</div>
+        <div class="ctx-spk-chips">
+          <button
+            v-for="opt in speakerOptions"
+            :key="opt"
+            class="ctx-spk-chip"
+            @click="changeSpeakerForSelection(opt)"
+          >
+            {{ opt }}
+          </button>
+          <input
+            v-model="selSpkInput"
+            class="ctx-spk-new"
+            placeholder="Новый спикер…"
+            @mousedown.stop
+            @mouseup.stop
+            @keydown.enter.prevent="canCreateSelSpeaker && changeSpeakerForSelection(selSpkInput)"
+            @keydown.esc.prevent="hidePicker()"
+          />
+          <button
+            v-if="canCreateSelSpeaker"
+            class="ctx-spk-chip ctx-spk-create"
+            @click="changeSpeakerForSelection(selSpkInput)"
+          >
+            ＋ {{ selSpkInput.trim() }}
+          </button>
+        </div>
+      </div>
       <template v-for="g in pickerGroups" :key="g.group">
         <div class="ctx-group">{{ g.group }}</div>
         <button
@@ -1355,6 +1480,50 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   margin-bottom: 4px;
 }
 .ctx-play-icon { flex: 0 0 auto; font-size: 11px; }
+
+.ctx-spk {
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 6px;
+  margin-bottom: 4px;
+}
+.ctx-spk-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 2px 10px 4px;
+}
+.ctx-spk-chip {
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
+  background: #14161d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ctx-spk-chip:hover {
+  border-color: var(--accent);
+  background: #1d2030;
+}
+.ctx-spk-new {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: #14161d;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  width: 9ch;
+  min-width: 7ch;
+}
+.ctx-spk-new:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.ctx-spk-create { color: #7ee0a0; }
 
 .btn {
   background: var(--accent);
