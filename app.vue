@@ -1,16 +1,9 @@
 <script setup lang="ts">
-import type { Segment } from '~/composables/useTranscription'
-import type { SavedSegment } from '~/composables/useAnnotations'
 import { sha256File } from '~/utils/fileHash'
-import { ALL_GROUPS, classMeta } from '~/utils/speechClasses'
+import { ALL_GROUPS } from '~/utils/speechClasses'
+import type { RWord } from '~/composables/useTranscriptDoc'
 
-// Автофокус для инлайн-редактора слова
-const vFocus = {
-  mounted: (el: HTMLInputElement) => {
-    el.focus()
-    el.select()
-  }
-}
+type PickCtx = { kind: 'create' } | { kind: 'edit'; index: number }
 
 const {
   status,
@@ -41,133 +34,78 @@ const {
   load: loadAnnos
 } = useAnnotations()
 
-// Правки распознанного текста: ключ — время начала слова (стабильно между
-// одинаковыми транскрипциями), значение — исправленное слово.
-// Правки распознанного текста (in-session слой поверх слов). При переоткрытии
-// не восстанавливаются наложением — источник истины уже финальный текст в
-// сохранённой структуре, а edits нужны только для текущего сеанса правок.
-const edits = ref<Record<string, string>>({})
+const {
+  mediaEl,
+  speed,
+  SPEEDS,
+  seek,
+  playRange,
+  playMedia,
+  pauseMedia,
+  onTimeUpdate,
+  onMediaPlay,
+  currentTime
+} = usePlayer()
 
-// Правки текста тоже «расхолаживают» кнопку сохранения (разметку это делает
-// сама useAnnotations через add/remove/changeClass).
-watch(edits, () => (annosSaved.value = false), { deep: true })
+// Модель транскрипта: слова, правки текста, оверрайды спикеров, подсветка.
+const {
+  edits,
+  speakerEdits,
+  customSpeakers,
+  editingKey,
+  editValue,
+  wordSpans,
+  renderSegments,
+  activeWordIdx,
+  wordRunsMap,
+  speakerOptions,
+  plainText,
+  hasEdits,
+  startEdit,
+  commitEdit,
+  cancelEdit,
+  buildSegments,
+  changeSpeakerForSelection,
+  onAudioTranscribe,
+  resetSession
+} = useTranscriptDoc({ result, annos, addAnno, annosSaved, currentTime })
 
-// Ручное переназначение спикеров: диаризация часто лепит всё в один SPEAKER_00
-// (например, если это один человек «разными голосами»), поэтому даём править
-// спикера посегментно. Ключ — тот же стабильный ключ сегмента (время начала),
-// значение — имя спикера ('' = спикер снят). Пустой оверрайд отличается от
-// «нет оверрайда» (undefined), поэтому храним '' явно.
-const speakerEdits = ref<Record<string, string>>({})
-watch(speakerEdits, () => (annosSaved.value = false), { deep: true })
+// Пикер спикера над кнопкой сегмента.
+const {
+  spkEl,
+  spkOpen,
+  hideSpk,
+  spkInput,
+  spkCurrent,
+  openSpeakerPicker,
+  applySpeaker,
+  clearSpeaker
+} = useSpeakerPicker({ speakerEdits, customSpeakers })
 
-const dragging = ref(false)
-const fileInput = ref<HTMLInputElement | null>(null)
-
-// ---- проигрыватель ----
-const mediaEl = ref<HTMLMediaElement | null>(null)
-const currentTime = ref(0)
-// Верхняя граница воспроизведения: доиграв до неё, ставим на паузу. Нужна,
-// чтобы прослушивать выделенный фрагмент, а не «убегать» дальше по тексту.
-const playBound = ref<number | null>(null)
-
-// Скорость воспроизведения. Замедление помогает расслышать артефакты речи.
-// preservesPitch держим включённым, чтобы тон не «плыл» при 0.25–0.5×.
-const SPEEDS = [0.25, 0.5, 0.75, 1]
-const speed = ref(1)
-function applySpeed() {
-  const el = mediaEl.value
-  if (!el) return
-  el.playbackRate = speed.value
-  // @ts-ignore — вендорные варианты для старых браузеров
-  el.preservesPitch = el.mozPreservesPitch = el.webkitPreservesPitch = true
-}
-watch([speed, mediaEl], applySpeed)
-
-function onTimeUpdate() {
-  const el = mediaEl.value
-  currentTime.value = el?.currentTime ?? 0
-  // Дошли до конца выделенного фрагмента — останавливаемся.
-  if (playBound.value != null && el && el.currentTime >= playBound.value) {
-    el.pause()
-    playBound.value = null
-  }
-}
-
-function seek(t?: number) {
-  if (t == null || !mediaEl.value) return
-  playBound.value = null // ручная перемотка снимает ограничение выделением
-  stopBoundWatch()
-  mediaEl.value.currentTime = t
-  mediaEl.value.play()
-}
-
-// Слежение за верхней границей через requestAnimationFrame (~60 Гц). Событие
-// timeupdate тикает лишь ~4 раза в секунду и проскакивает конец слова на ~250мс
-// (заезжает в следующее) — rAF даёт точность ~16мс.
-let boundRaf: number | null = null
-function stopBoundWatch() {
-  if (boundRaf != null) {
-    cancelAnimationFrame(boundRaf)
-    boundRaf = null
-  }
-}
-function boundTick() {
-  const el = mediaEl.value
-  if (playBound.value == null || !el || el.paused || el.ended) {
-    boundRaf = null
-    return
-  }
-  if (el.currentTime >= playBound.value) {
-    el.pause()
-    playBound.value = null
-    boundRaf = null
-    return
-  }
-  boundRaf = requestAnimationFrame(boundTick)
-}
-function startBoundWatch() {
-  stopBoundWatch()
-  boundRaf = requestAnimationFrame(boundTick)
-}
-
-// Проиграть только диапазон [start, end] и остановиться на конце.
-function playRange(start?: number, end?: number) {
-  const el = mediaEl.value
-  if (!el || start == null || end == null || end <= start) return
-  el.currentTime = start
-  playBound.value = end
-  el.play()
-  startBoundWatch()
-}
-
-// Возобновление воспроизведения (в т.ч. нативной кнопкой) — если ограничение
-// ещё активно, поднимаем точный watch заново.
-function onMediaPlay() {
-  if (playBound.value != null) startBoundWatch()
-}
-
-function playMedia() {
-  playBound.value = null // обычное воспроизведение — без ограничения выделением
-  stopBoundWatch()
-  mediaEl.value?.play()
-}
-function pauseMedia() {
-  mediaEl.value?.pause()
-}
-
-// Одиночный клик/тап по слову — перемотка (откладываем), двойной — правка слова.
-// Двойной определяем вручную по времени между тапами одного и того же слова:
-// работает и мышью, и на тач-устройствах, где событие dblclick не срабатывает.
+// ---- клик/двойной тап по слову ----
+// Одиночный клик/тап — перемотка (откладываем), двойной — правка слова. Двойной
+// определяем вручную по времени между тапами одного и того же слова: работает и
+// мышью, и на тач-устройствах, где событие dblclick не срабатывает.
 const TAP_MS = 300
 let clickTimer: ReturnType<typeof setTimeout> | null = null
 let lastTap = { idx: -1, t: 0 }
+// Войти в правку слова: отменяем отложенную перемотку и ставим на паузу, чтобы
+// редактировать в тишине без дёрганья стейта.
+function beginEdit(w: RWord) {
+  if (clickTimer) {
+    clearTimeout(clickTimer)
+    clickTimer = null
+  }
+  pauseMedia()
+  startEdit(w)
+}
 function onWordClick(w: RWord) {
   const now = Date.now()
   // Двойной тап проверяем ПЕРВЫМ: на десктопе он выделяет слово браузером,
   // и проверка выделения ниже иначе съела бы событие до входа в правку.
   if (w.idx === lastTap.idx && now - lastTap.t < TAP_MS) {
     lastTap = { idx: -1, t: 0 }
-    startEdit(w) // сам отменит отложенную перемотку и снимет выделение
+    beginEdit(w)
     return
   }
   // Одиночный: если есть выделение (пользователь выделяет текст для разметки) —
@@ -185,266 +123,28 @@ function onWordClick(w: RWord) {
   }, TAP_MS)
 }
 
-// ---- транскрипт по словам ----
-const segments = computed<Segment[]>(() => result.value?.segments ?? [])
-
-// Спан сегмента по времени: от начала первого слова до конца последнего.
-function segSpan(s: Segment): { st: number; en: number } {
-  const st = s.words?.[0]?.start ?? s.start ?? 0
-  const last = s.words?.length ? s.words[s.words.length - 1] : undefined
-  const en = last?.end ?? last?.start ?? s.end ?? st
-  return { st, en }
-}
-// Спаны всех слов — для валидации вставки текста с дорожки (передаём в
-// WaveTrack). Ошибку показываем, если регион задевает больше одного слова.
-const wordSpans = computed<{ start: number; end: number }[]>(() => {
-  const out: { start: number; end: number }[] = []
-  for (const s of segments.value) {
-    for (const w of s.words ?? []) {
-      if (w.start != null && w.end != null) out.push({ start: w.start, end: w.end })
-    }
-  }
-  return out
-})
-
-interface RWord {
-  idx: number
-  text: string
-  start?: number
-  end?: number
-}
-interface RSeg {
-  key: number
-  start?: number
-  speaker?: string
-  speakerKey: string
-  words: RWord[]
-}
-
-// Разворачиваем сегменты в слова со сквозным индексом.
-// Если у сегмента нет word-level разметки — весь текст как одно «слово».
-const renderSegments = computed<RSeg[]>(() => {
-  let idx = 0
-  return segments.value.map((seg, key) => {
-    let words: RWord[]
-    if (seg.words?.length) {
-      words = seg.words.map((w) => ({
-        idx: idx++,
-        text: (w.word ?? '').trim(),
-        start: w.start,
-        end: w.end
-      }))
-    } else {
-      words = [{ idx: idx++, text: seg.text ?? '', start: seg.start, end: seg.end }]
-    }
-    const start = words[0]?.start ?? seg.start
-    // Стабильный ключ сегмента для оверрайда спикера (как у правок слов — по времени).
-    const speakerKey = start != null ? start.toFixed(3) : `idx-${key}`
-    const override = speakerEdits.value[speakerKey]
-    return {
-      key,
-      start,
-      speakerKey,
-      speaker: override !== undefined ? override : seg.speaker,
-      words
-    }
-  })
-})
-
-// Слово, играющее прямо сейчас
-const activeWordIdx = computed(() => {
-  const t = currentTime.value
-  for (const s of renderSegments.value) {
-    for (const w of s.words) {
-      if (w.start != null && w.end != null && t >= w.start && t < w.end) return w.idx
-    }
-  }
-  return -1
-})
-
-// Слово разбиваем на «руны» — непрерывные отрезки символов с одним цветом
-// разметки (или без). Так подсветка ложится только на размеченную часть слова
-// (слог/букву), а не на слово целиком. Границы аннотации внутри слова находим
-// обратной интерполяцией времени в символы (у WhisperX тайминги пословные).
-interface WordRun {
-  text: string
-  color: string | null
-}
-const wordRunsMap = computed<Record<number, WordRun[]>>(() => {
-  const map: Record<number, WordRun[]> = {}
-  const textAnnos = annos.value.filter((an) => an.source === 'text')
-  for (const s of renderSegments.value) {
-    for (const w of s.words) {
-      const text = wordText(w)
-      const L = text.length
-      if (w.start == null || w.end == null || L === 0) {
-        map[w.idx] = [{ text, color: null }]
-        continue
-      }
-      const ws = w.start
-      const we = w.end
-      const denom = we - ws
-      const colors: (string | null)[] = new Array(L).fill(null)
-      for (const an of textAnnos) {
-        if (!(ws < an.end && we > an.start)) continue // не пересекается со словом
-        let c0 = denom > 0 ? Math.round(((an.start - ws) / denom) * L) : 0
-        let c1 = denom > 0 ? Math.round(((an.end - ws) / denom) * L) : L
-        c0 = Math.max(0, Math.min(L, c0))
-        c1 = Math.max(0, Math.min(L, c1))
-        if (c1 <= c0) {
-          // Слишком узкий диапазон — подсветим хотя бы один символ в пределах слова.
-          c0 = Math.min(c0, L - 1)
-          c1 = c0 + 1
-        }
-        const col = classColor(an.cls)
-        for (let i = c0; i < c1; i++) if (colors[i] == null) colors[i] = col
-      }
-      // Схлопываем соседние символы одного цвета в непрерывные руны.
-      const runs: WordRun[] = []
-      for (let i = 0; i < L; ) {
-        const col = colors[i]
-        let j = i + 1
-        while (j < L && colors[j] === col) j++
-        runs.push({ text: text.slice(i, j), color: col })
-        i = j
-      }
-      map[w.idx] = runs
-    }
-  }
-  return map
-})
-
-// ---- редактирование распознанного текста ----
-// Ключ правки — время начала слова; для слов без времени — по idx (не сохраняем).
-function wordKey(w: RWord) {
-  return w.start != null ? w.start.toFixed(3) : `idx-${w.idx}`
-}
-function wordText(w: RWord) {
-  return edits.value[wordKey(w)] ?? w.text
-}
-function isEdited(w: RWord) {
-  const v = edits.value[wordKey(w)]
-  return v != null && v !== w.text
-}
-
-const editingKey = ref<string | null>(null)
-// Буфер редактируемого слова: инпут привязан к нему через v-model, поэтому
-// ре-рендеры (тики timeupdate во время проигрывания) не сбрасывают ввод.
-const editValue = ref('')
-function startEdit(w: RWord) {
-  // Отменяем отложенную перемотку от одиночного клика и ставим на паузу,
-  // чтобы редактировать в тишине без дёрганья стейта.
-  if (clickTimer) {
-    clearTimeout(clickTimer)
-    clickTimer = null
-  }
-  mediaEl.value?.pause()
-  // Двойной клик выделяет слово браузером — снимаем, чтобы не всплыло меню классов.
-  window.getSelection()?.removeAllRanges()
-  editValue.value = wordText(w)
-  editingKey.value = wordKey(w)
-}
-function commitEdit(w: RWord) {
-  const v = editValue.value.trim()
-  const k = wordKey(w)
-  if (v && v !== w.text) edits.value[k] = v
-  else delete edits.value[k]
-  editingKey.value = null
-}
-function cancelEdit() {
-  editingKey.value = null
-}
-
-// Есть ли правки текста (для доступности кнопки «Сохранить»).
-const hasEdits = computed(() => Object.keys(edits.value).length > 0)
-
-// Структура транскрипта для сохранения: слова с таймингами и финальным текстом.
-function buildSegments(): SavedSegment[] {
-  return renderSegments.value.map((s) => ({
-    speaker: s.speaker || null,
-    start: s.start ?? null,
-    words: s.words.map((w) => ({
-      text: wordText(w),
-      start: w.start ?? null,
-      end: w.end ?? null
-    }))
-  }))
-}
-
-// ---- пикер спикера (creatable select) ----
-const {
-  floating: spkEl,
-  open: spkOpen,
-  show: showSpk,
-  hide: hideSpk
-} = useFloatingMenu()
-const spkTargetKey = ref<string | null>(null)
-const spkInput = ref('')
-// Текущий спикер открытого сегмента — для подсветки активной опции.
-const spkCurrent = ref('')
-// Имена, которые пользователь создал в этой сессии. Держим отдельно от
-// назначенных на сегменты, чтобы созданное имя не исчезало из списка, если
-// его временно ни на одном сегменте нет (напр. переназначили сегмент дальше).
-const customSpeakers = ref<string[]>([])
-
-// Опции селекта: имена, назначенные на сегменты, ∪ созданные в сессии.
-const speakerOptions = computed(() => {
-  const set = new Set<string>()
-  for (const s of renderSegments.value) if (s.speaker) set.add(s.speaker)
-  for (const n of customSpeakers.value) set.add(n)
-  return [...set].sort()
-})
-// Показываем «Создать …», только если введённого имени ещё нет в списке.
-const canCreateSpeaker = computed(() => {
-  const v = spkInput.value.trim()
-  return !!v && !speakerOptions.value.includes(v)
-})
-
-function openSpeakerPicker(seg: RSeg, e: MouseEvent) {
-  spkTargetKey.value = seg.speakerKey
-  spkCurrent.value = seg.speaker ?? ''
-  // Предзаполняем текущим именем (v-focus его выделит — можно сразу перепечатать).
-  // Фильтрации по вводу нет, поэтому список спикеров всё равно виден целиком.
-  spkInput.value = seg.speaker ?? ''
-  showSpk(e.currentTarget as HTMLElement)
-}
-function applySpeaker(name: string) {
-  const key = spkTargetKey.value
-  if (key == null) return
-  const v = name.trim()
-  // Запоминаем созданное имя, чтобы оно осталось в списке селекта.
-  if (v && !customSpeakers.value.includes(v)) customSpeakers.value.push(v)
-  speakerEdits.value[key] = v
-  hideSpk()
-}
-function clearSpeaker() {
-  const key = spkTargetKey.value
-  if (key == null) return
-  speakerEdits.value[key] = ''
-  hideSpk()
-}
-
-// ---- меню классов (Floating UI): и создание, и переклассификация ----
-const transcriptEl = ref<HTMLElement | null>(null)
+// ---- меню классов (Floating UI): создание и переклассификация ----
+const transcriptRef = ref<{ $el: HTMLElement } | null>(null)
 const {
   floating: pickerEl,
   open: pickerOpen,
   show: showPicker,
   hide: hidePicker
 } = useFloatingMenu()
-type PickCtx = { kind: 'create' } | { kind: 'edit'; index: number }
 const pickCtx = ref<PickCtx>({ kind: 'create' })
 const pending = ref<{ start: number; end: number; text: string } | null>(null)
-
-// И текст, и аудиодорожка выбирают нарушение из одного общего списка.
 const pickerGroups = ALL_GROUPS
-
-// Имя нового спикера, вводимое прямо в меню выделения (создать и сразу назначить).
+// Имя нового спикера в меню выделения (сбрасываем при смене выделения).
 const selSpkInput = ref('')
-const canCreateSelSpeaker = computed(() => {
-  const v = selSpkInput.value.trim()
-  return !!v && !speakerOptions.value.includes(v)
-})
+
+// Функциональные ref: всплывающие меню — компоненты, а Floating UI нужен их
+// корневой DOM-элемент ($el одно-корневого компонента).
+function setPickerEl(c: any) {
+  pickerEl.value = c?.$el ?? null
+}
+function setSpkEl(c: any) {
+  spkEl.value = c?.$el ?? null
+}
 
 // Реакция на изменение выделения. Слушаем document `selectionchange` (с
 // дебаунсом) вместо mouseup — так работает и мышью на десктопе, и выделением
@@ -460,7 +160,7 @@ function evaluateSelection() {
   if (!sel || sel.isCollapsed || sel.rangeCount === 0) return
 
   const range = sel.getRangeAt(0)
-  const c = transcriptEl.value
+  const c = transcriptRef.value?.$el
   if (!c || !c.contains(range.commonAncestorContainer)) return
 
   // Считаем тайминги с точностью до символа. У WhisperX тайминги только
@@ -540,149 +240,19 @@ function playSelection() {
   if (pending.value) playRange(pending.value.start, pending.value.end)
 }
 
-// ---- смена спикера у выделенного фрагмента ----
-// Спикер — свойство сегмента целиком, поэтому чтобы поменять его у произвольного
-// куска текста, сегмент приходится разбивать по границам выделения.
-
-// Слова, попавшие в выделение [start, end]. Слово считаем выделенным, если
-// диапазон покрывает хотя бы половину его длительности (частичное касание края
-// не тащит лишнее слово). Если по этому правилу не попало ни одно слово (напр.
-// выделен слог) — берём одно слово с наибольшим перекрытием, чтобы действие
-// всегда что-то делало. Возвращаем сквозные idx слов (как в renderSegments).
-function selectedWordIdxs(start: number, end: number): Set<number> {
-  const sel = new Set<number>()
-  let best = { idx: -1, ov: 0 }
-  for (const s of renderSegments.value) {
-    for (const w of s.words) {
-      if (w.start == null) continue
-      const we = w.end ?? w.start
-      const dur = we - w.start
-      const ov = Math.min(end, we) - Math.max(start, w.start)
-      if (ov <= 0) continue
-      if (ov > best.ov) best = { idx: w.idx, ov }
-      if (dur <= 0 || ov / dur >= 0.5) sel.add(w.idx)
-    }
-  }
-  if (!sel.size && best.idx >= 0) sel.add(best.idx)
-  return sel
-}
-
-// Назначить выделенному фрагменту спикера name (из числа текущих). Разбиваем
-// затронутые сегменты на непрерывные отрезки [до | выделенное | после]:
-// выделенному отрезку — новый спикер, остальным — прежний эффективный.
-// Эффективного спикера (оверрайд speakerEdits ∪ seg.speaker) запекаем во все
-// сегменты сразу, после чего speakerEdits можно очистить целиком — ключи по
-// времени старта всё равно поехали из-за разбиения.
-function changeSpeakerForSelection(name: string) {
+// Сменить спикера у выделенного фрагмента (разбиение сегментов — в модели).
+function onChangeSpeaker(name: string) {
   const p = pending.value
-  const res = result.value
-  if (!p || !res?.segments) {
-    hidePicker()
-    return
-  }
-  const newSpk = name.trim()
-  const sel = selectedWordIdxs(p.start, p.end)
-  const rsegs = renderSegments.value
-  const out: Segment[] = []
-  let changed = false
-
-  res.segments.forEach((seg, i) => {
-    const rseg = rsegs[i]
-    const eff = rseg?.speaker
-    const words = seg.words ?? []
-    if (!words.length || !rseg) {
-      out.push({ ...seg, speaker: eff || undefined })
-      return
-    }
-    const flags = words.map((_, wi) => sel.has(rseg.words[wi].idx))
-    if (!flags.some(Boolean)) {
-      out.push({ ...seg, speaker: eff || undefined })
-      return
-    }
-    changed = true
-    // Режем на непрерывные отрезки одинакового флага выделения.
-    let from = 0
-    for (let wi = 1; wi <= words.length; wi++) {
-      if (wi === words.length || flags[wi] !== flags[from]) {
-        const slice = words.slice(from, wi)
-        out.push({
-          ...seg,
-          start: slice[0].start ?? seg.start,
-          speaker: (flags[from] ? newSpk : eff) || undefined,
-          words: slice
-        })
-        from = wi
-      }
-    }
-  })
-
-  if (changed) {
-    if (newSpk && !customSpeakers.value.includes(newSpk)) customSpeakers.value.push(newSpk)
-    result.value = { ...res, segments: out }
-    speakerEdits.value = {}
-    annosSaved.value = false
-  }
+  if (p) changeSpeakerForSelection(name, p)
   window.getSelection()?.removeAllRanges()
   pending.value = null
   selSpkInput.value = ''
   hidePicker()
 }
 
-// Разметка артефакта прямо на аудиодорожке (вдох/щелчок/спазм)
+// Разметка артефакта прямо на аудиодорожке (вдох/щелчок/спазм).
 function onAudioAdd(a: { start: number; end: number; cls: string }) {
   addAnno({ start: a.start, end: a.end, text: '', cls: a.cls, source: 'audio' })
-}
-
-// Вставка транскрипции с дорожки: новое слово попадает в текст транскрипта на
-// нужное по времени место, класс вешается разметкой (подсветит слово).
-// Существующие слова не трогаем; при пересечении >1 сегмента WaveTrack не даёт
-// сюда дойти (валидирует заранее), но подстрахуемся и здесь.
-function onAudioTranscribe(a: {
-  start: number
-  end: number
-  cls: string
-  text: string
-}) {
-  const res = result.value
-  if (!res?.segments) return
-
-  // Работаем с копией, затем переприсваиваем result — гарантированная реактивность.
-  const segs: Segment[] = res.segments.map((s) => ({
-    ...s,
-    words: s.words ? [...s.words] : []
-  }))
-
-  // Ищем сегмент с наибольшим пересечением по времени (ошибку про >1 слово уже
-  // отсеял WaveTrack). Если пересечений нет — регион в тишине, новый сегмент.
-  let target = -1
-  let best = 0
-  segs.forEach((s, i) => {
-    const { st, en } = segSpan(s)
-    const ov = Math.min(a.end, en) - Math.max(a.start, st)
-    if (ov > best) {
-      best = ov
-      target = i
-    }
-  })
-
-  const newWord = { word: a.text, start: a.start, end: a.end }
-  if (target >= 0) {
-    // Вставляем слово в сегмент по возрастанию времени начала.
-    const words = segs[target].words!
-    const idx = words.findIndex((w) => (w.start ?? 0) > a.start)
-    if (idx === -1) words.push(newWord)
-    else words.splice(idx, 0, newWord)
-  } else {
-    // Регион в тишине между сегментами — новый сегмент на нужном месте.
-    const newSeg: Segment = { start: a.start, words: [newWord] }
-    const idx = segs.findIndex((s) => segSpan(s).st > a.start)
-    if (idx === -1) segs.push(newSeg)
-    else segs.splice(idx, 0, newSeg)
-  }
-
-  result.value = { ...res, segments: segs }
-  // Класс — текстовой разметкой: подсветит вставленное слово и попадёт в панель.
-  addAnno({ start: a.start, end: a.end, text: a.text, cls: a.cls, source: 'text' })
 }
 
 function onDocMouseDown(e: MouseEvent) {
@@ -704,39 +274,22 @@ onMounted(() => {
 onBeforeUnmount(() => {
   document.removeEventListener('mousedown', onDocMouseDown)
   document.removeEventListener('selectionchange', onSelectionChange)
-  stopBoundWatch()
 })
 
 // ---- загрузка файла ----
-function pick() {
-  fileInput.value?.click()
-}
 // Открытие файла: считаем хеш, проверяем сохранённые данные. Если есть
 // сохранённая структура транскрипта — рендерим из неё (WhisperX не гоняем,
 // тайминги и разметка сохраняются). Иначе — распознаём заново.
-async function openFile(file: File) {
-  edits.value = {}
-  speakerEdits.value = {}
-  editingKey.value = null
-  customSpeakers.value = []
+async function onSelectFile(file: File) {
+  resetSession()
   const hash = await sha256File(file)
-  const { segments } = await loadAnnos(hash) // заодно ставит разметку
-  if (segments.length) openSaved(file, hash, segments)
+  const { segments: saved } = await loadAnnos(hash) // заодно ставит разметку
+  if (saved.length) openSaved(file, hash, saved)
   else transcribe(file, hash)
 }
-function onInput(e: Event) {
-  const files = (e.target as HTMLInputElement).files
-  if (files?.length) openFile(files[0])
-}
-function onDrop(e: DragEvent) {
-  dragging.value = false
-  const files = e.dataTransfer?.files
-  if (files?.length) openFile(files[0])
-}
 
-// Распознать текущий файл заново через WhisperX. Правки текста при этом
-// теряются (они привязаны к старым словам); разметка остаётся — она по
-// абсолютному времени аудио.
+// Распознать текущий файл заново через WhisperX. Правки текста при этом теряются
+// (они привязаны к старым словам); разметка остаётся — она по абсолютному времени.
 function reRecognize() {
   if (
     !window.confirm(
@@ -744,10 +297,7 @@ function reRecognize() {
     )
   )
     return
-  edits.value = {}
-  speakerEdits.value = {}
-  customSpeakers.value = []
-  editingKey.value = null
+  resetSession()
   retranscribe()
 }
 
@@ -763,46 +313,16 @@ function doSave() {
 
 function newFile() {
   clearAnnos()
-  edits.value = {}
-  speakerEdits.value = {}
-  customSpeakers.value = []
-  editingKey.value = null
+  resetSession()
   reset()
 }
 
-// ---- прочее ----
-// Текст для копирования — с учётом правок распознавания.
-const plainText = computed(() => {
-  if (renderSegments.value.length) {
-    return renderSegments.value
-      .map((s) => s.words.map((w) => wordText(w)).join(' ').replace(/\s+/g, ' ').trim())
-      .filter(Boolean)
-      .join('\n')
-  }
-  if (result.value?.text) return result.value.text
-  return segments.value.map((s) => s.text?.trim()).filter(Boolean).join('\n')
-})
-
+// ---- копирование текста ----
 const copied = ref(false)
 async function copyText() {
   await navigator.clipboard.writeText(plainText.value)
   copied.value = true
   setTimeout(() => (copied.value = false), 1500)
-}
-
-function classColor(cls: string) {
-  return classMeta(cls)?.color ?? '#888'
-}
-function classLabel(cls: string) {
-  const m = classMeta(cls)
-  if (!m) return cls
-  return m.group === 'Общее' ? m.label : `${m.group}: ${m.label}`
-}
-function fmt(t?: number) {
-  if (t == null) return ''
-  const m = Math.floor(t / 60)
-  const s = Math.floor(t % 60)
-  return `${m}:${s.toString().padStart(2, '0')}`
 }
 </script>
 
@@ -814,49 +334,27 @@ function fmt(t?: number) {
     </header>
 
     <!-- Загрузка -->
-    <section
-      v-if="status === 'idle'"
-      class="dropzone"
-      :class="{ dragging }"
-      @click="pick"
-      @dragover.prevent="dragging = true"
-      @dragleave.prevent="dragging = false"
-      @drop.prevent="onDrop"
-    >
-      <input
-        ref="fileInput"
-        type="file"
-        accept="audio/*,video/*"
-        hidden
-        @change="onInput"
-      />
-      <div class="icon">⬆</div>
-      <p><strong>Перетащи файл сюда</strong> или кликни, чтобы выбрать</p>
-      <p class="hint">аудио или видео</p>
-    </section>
+    <DropZone v-if="status === 'idle'" @select="onSelectFile" />
 
     <!-- Процесс -->
-    <section v-else-if="isBusy" class="status-card">
-      <div class="spinner" />
-      <p class="status-text">
-        {{ status === 'uploading' ? 'Загружаю файл…' : 'Распознаю речь…' }}
-      </p>
-      <p v-if="fileName" class="filename">{{ fileName }}</p>
-      <p v-if="jobId" class="jobid">id: {{ jobId }}</p>
-
-      <div v-if="mediaUrl" class="player">
-        <video v-if="isVideo" :src="mediaUrl" controls />
-        <audio v-else :src="mediaUrl" controls />
-      </div>
-    </section>
+    <TranscribeStatus
+      v-else-if="isBusy"
+      mode="busy"
+      :status="status"
+      :file-name="fileName"
+      :job-id="jobId"
+      :media-url="mediaUrl"
+      :is-video="isVideo"
+    />
 
     <!-- Ошибка -->
-    <section v-else-if="status === 'error'" class="status-card error">
-      <div class="icon">⚠</div>
-      <p class="status-text">Ошибка</p>
-      <p class="err-msg">{{ error }}</p>
-      <button class="btn" @click="newFile">Заново</button>
-    </section>
+    <TranscribeStatus
+      v-else-if="status === 'error'"
+      mode="error"
+      :status="status"
+      :error="error"
+      @reset="newFile"
+    />
 
     <!-- Результат -->
     <section v-else-if="status === 'done'" class="result">
@@ -934,77 +432,29 @@ function fmt(t?: number) {
       />
 
       <template v-if="renderSegments.length">
-        <p class="mark-hint">
-          Выделите текст → выберите класс нарушения. Тап/клик по слову —
-          проиграть его, двойной тап/клик — исправить слово.
-        </p>
-        <div ref="transcriptEl" class="segments">
-          <div v-for="seg in renderSegments" :key="seg.key" class="segment">
-            <span class="time" @click="seek(seg.start)">{{ fmt(seg.start) }}</span>
-            <button
-              class="speaker"
-              :class="{ 'speaker-empty': !seg.speaker }"
-              title="Изменить спикера"
-              @click="openSpeakerPicker(seg, $event)"
-            >{{ seg.speaker || '＋' }}</button>
-            <span class="words">
-              <template v-for="w in seg.words" :key="w.idx">
-                <input
-                  v-if="editingKey === wordKey(w)"
-                  v-model="editValue"
-                  v-focus
-                  class="word-input"
-                  @keydown.enter.prevent="commitEdit(w)"
-                  @keydown.esc.prevent="cancelEdit()"
-                  @blur="commitEdit(w)"
-                  @mousedown.stop
-                  @mouseup.stop
-                />
-                <span
-                  v-else
-                  class="word"
-                  :class="{
-                    active: w.idx === activeWordIdx,
-                    edited: isEdited(w)
-                  }"
-                  :data-start="w.start"
-                  :data-end="w.end"
-                  @click="onWordClick(w)"
-                  ><span
-                    v-for="(run, ri) in wordRunsMap[w.idx]"
-                    :key="ri"
-                    class="run"
-                    :class="{ 'run-annotated': !!run.color }"
-                    :style="run.color ? { borderBottomColor: run.color } : undefined"
-                    >{{ run.text }}</span
-                  >{{ ' ' }}</span
-                >
-              </template>
-            </span>
-          </div>
-        </div>
+        <TranscriptView
+          ref="transcriptRef"
+          :segments="renderSegments"
+          :active-word-idx="activeWordIdx"
+          :word-runs-map="wordRunsMap"
+          :editing-key="editingKey"
+          :edits="edits"
+          v-model:edit-value="editValue"
+          @seek="seek"
+          @word-click="onWordClick"
+          @open-speaker="openSpeakerPicker"
+          @commit-edit="commitEdit"
+          @cancel-edit="cancelEdit"
+        />
 
-        <!-- Панель разметки -->
-        <div v-if="annos.length" class="annos">
-          <div class="annos-head">Разметка · {{ annos.length }}</div>
-          <div v-for="(a, i) in annos" :key="i" class="anno" @click="seek(a.start)">
-            <span class="dot" :style="{ background: classColor(a.cls) }" />
-            <span class="anno-label">{{ classLabel(a.cls) }}</span>
-            <span class="anno-time">{{ fmt(a.start) }}–{{ fmt(a.end) }}</span>
-            <span class="anno-text">{{ a.text }}</span>
-            <button
-              class="anno-edit"
-              title="Сменить класс"
-              @click.stop="editAnnoClass(i, ($event.currentTarget as HTMLElement))"
-            >
-              ✎
-            </button>
-            <button class="anno-del" title="Удалить" @click.stop="removeAnno(i)">
-              ×
-            </button>
-          </div>
-          <p v-if="annosError" class="anno-err">{{ annosError }}</p>
-        </div>
+        <AnnotationsPanel
+          v-if="annos.length"
+          :annos="annos"
+          :error="annosError"
+          @seek="seek"
+          @edit-class="editAnnoClass"
+          @remove="removeAnno"
+        />
       </template>
 
       <pre v-else-if="plainText" class="plain">{{ plainText }}</pre>
@@ -1012,100 +462,31 @@ function fmt(t?: number) {
     </section>
 
     <!-- Меню классов (позиционируется через Floating UI) -->
-    <div
+    <ClassMenu
       v-if="pickerOpen"
-      ref="pickerEl"
-      class="ctx-menu"
-      @mousedown.prevent.stop
-    >
-      <button
-        v-if="pickCtx.kind === 'create' && pending"
-        class="ctx-item ctx-play"
-        @click="playSelection()"
-      >
-        <span class="ctx-play-icon">▶</span>
-        <span class="ctx-label">Прослушать выделенное</span>
-      </button>
-      <div v-if="pickCtx.kind === 'create' && pending" class="ctx-spk">
-        <div class="ctx-group">Сменить спикера</div>
-        <div class="ctx-spk-chips">
-          <button
-            v-for="opt in speakerOptions"
-            :key="opt"
-            class="ctx-spk-chip"
-            @click="changeSpeakerForSelection(opt)"
-          >
-            {{ opt }}
-          </button>
-          <input
-            v-model="selSpkInput"
-            class="ctx-spk-new"
-            placeholder="Новый спикер…"
-            @mousedown.stop
-            @mouseup.stop
-            @keydown.enter.prevent="canCreateSelSpeaker && changeSpeakerForSelection(selSpkInput)"
-            @keydown.esc.prevent="hidePicker()"
-          />
-          <button
-            v-if="canCreateSelSpeaker"
-            class="ctx-spk-chip ctx-spk-create"
-            @click="changeSpeakerForSelection(selSpkInput)"
-          >
-            ＋ {{ selSpkInput.trim() }}
-          </button>
-        </div>
-      </div>
-      <template v-for="g in pickerGroups" :key="g.group">
-        <div class="ctx-group">{{ g.group }}</div>
-        <button
-          v-for="c in g.items"
-          :key="c.id"
-          class="ctx-item"
-          :title="c.description"
-          @click="applyClass(c.id)"
-        >
-          <span class="dot" :style="{ background: c.color }" />
-          <span class="ctx-text">
-            <span class="ctx-label">{{ c.label }}</span>
-            <span v-if="c.description" class="ctx-desc">{{ c.description }}</span>
-          </span>
-        </button>
-      </template>
-    </div>
+      :ref="setPickerEl"
+      :pick-ctx="pickCtx"
+      :pending="pending"
+      :groups="pickerGroups"
+      :speaker-options="speakerOptions"
+      v-model:sel-spk-input="selSpkInput"
+      @play="playSelection"
+      @apply-class="applyClass"
+      @change-speaker="onChangeSpeaker"
+      @close="hidePicker"
+    />
 
     <!-- Пикер спикера (creatable select), позиционируется через Floating UI -->
-    <div v-if="spkOpen" ref="spkEl" class="ctx-menu spk-menu">
-      <input
-        v-model="spkInput"
-        v-focus
-        class="spk-input"
-        placeholder="Имя спикера…"
-        @keydown.enter.prevent="applySpeaker(spkInput)"
-        @keydown.esc.prevent="hideSpk()"
-      />
-      <div class="spk-list">
-        <button
-          v-for="opt in speakerOptions"
-          :key="opt"
-          class="ctx-item spk-item"
-          :class="{ 'spk-active': opt === spkCurrent }"
-          @click="applySpeaker(opt)"
-        >
-          <span class="spk-check">{{ opt === spkCurrent ? '✓' : '' }}</span>
-          {{ opt }}
-        </button>
-        <button
-          v-if="canCreateSpeaker"
-          class="ctx-item spk-item spk-create"
-          @click="applySpeaker(spkInput)"
-        >
-          ＋ Создать «{{ spkInput.trim() }}»
-        </button>
-        <button class="ctx-item spk-item spk-clear" @click="clearSpeaker()">
-          Убрать спикера
-        </button>
-      </div>
-    </div>
+    <SpeakerMenu
+      v-if="spkOpen"
+      :ref="setSpkEl"
+      :speaker-options="speakerOptions"
+      :current="spkCurrent"
+      v-model:input="spkInput"
+      @apply="applySpeaker"
+      @clear="clearSpeaker"
+      @close="hideSpk"
+    />
   </div>
 </template>
 
@@ -1134,46 +515,6 @@ body {
 header { text-align: center; margin-bottom: 32px; }
 h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
 .sub { color: var(--muted); margin: 6px 0 0; }
-
-.dropzone {
-  border: 2px dashed var(--border);
-  border-radius: 16px;
-  padding: 64px 24px;
-  text-align: center;
-  cursor: pointer;
-  transition: 0.15s;
-  background: var(--card);
-}
-.dropzone:hover, .dropzone.dragging {
-  border-color: var(--accent);
-  background: #1d2030;
-}
-.dropzone .icon { font-size: 40px; margin-bottom: 12px; }
-.dropzone .hint { color: var(--muted); font-size: 14px; }
-
-.status-card {
-  background: var(--card);
-  border: 1px solid var(--border);
-  border-radius: 16px;
-  padding: 48px 24px;
-  text-align: center;
-}
-.status-card.error { border-color: var(--error); }
-.status-text { font-size: 18px; font-weight: 600; margin: 12px 0 4px; }
-.filename { color: var(--muted); margin: 4px 0; }
-.jobid { color: var(--muted); font-size: 12px; font-family: monospace; }
-.err-msg { color: var(--error); margin: 8px 0 20px; }
-.status-card .icon { font-size: 40px; }
-
-.spinner {
-  width: 40px; height: 40px;
-  margin: 0 auto;
-  border: 3px solid var(--border);
-  border-top-color: var(--accent);
-  border-radius: 50%;
-  animation: spin 0.8s linear infinite;
-}
-@keyframes spin { to { transform: rotate(360deg); } }
 
 .result {
   background: var(--card);
@@ -1245,120 +586,6 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   color: #fff;
 }
 
-.mark-hint {
-  margin: 0;
-  padding: 10px 20px;
-  font-size: 12px;
-  color: var(--muted);
-  border-bottom: 1px solid var(--border);
-}
-
-.segments { padding: 8px 0; }
-.segment {
-  display: grid;
-  grid-template-columns: 52px auto 1fr;
-  gap: 10px;
-  padding: 8px 20px;
-  align-items: baseline;
-}
-.time {
-  color: var(--muted);
-  font-size: 12px;
-  font-family: monospace;
-  cursor: pointer;
-}
-.time:hover { color: var(--accent); }
-.speaker {
-  color: var(--accent);
-  font-size: 12px;
-  font-weight: 600;
-  white-space: nowrap;
-  font-family: inherit;
-  background: none;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  padding: 1px 6px;
-  cursor: pointer;
-  transition: 0.12s;
-}
-.speaker:hover {
-  border-color: var(--accent);
-  background: #1d2030;
-}
-.speaker-empty {
-  color: var(--muted);
-  font-weight: 400;
-  opacity: 0.55;
-}
-.speaker-empty:hover { opacity: 1; }
-
-.spk-menu { width: 240px; }
-.spk-input {
-  font: inherit;
-  color: var(--text);
-  background: #14161d;
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  padding: 6px 8px;
-  margin-bottom: 6px;
-  width: 100%;
-}
-.spk-list { display: flex; flex-direction: column; gap: 2px; }
-.spk-item {
-  align-items: center;
-  font-size: 14px;
-  font-weight: 600;
-}
-.spk-check {
-  width: 12px;
-  flex: 0 0 auto;
-  color: var(--accent);
-  font-size: 12px;
-}
-.spk-active { color: var(--accent); }
-.spk-create { color: var(--accent); }
-.spk-clear {
-  color: var(--muted);
-  font-weight: 400;
-  border-top: 1px solid var(--border);
-  border-radius: 0;
-  margin-top: 4px;
-}
-.words {
-  line-height: 1.7;
-  /* явно разрешаем выделение текста (важно для iOS Safari) */
-  -webkit-user-select: text;
-  user-select: text;
-}
-.word {
-  cursor: pointer;
-  transition: background 0.1s;
-  /* убирает зум по двойному тапу и 300мс-задержку клика на мобилке */
-  touch-action: manipulation;
-}
-.word:hover { background: #262a38; }
-.word.active {
-  background: #2a3350;
-  color: #fff;
-}
-.word.edited { color: #ffd166; }
-/* Подсветка размеченной части слова живёт на «руне», а не на всём слове,
-   чтобы можно было подчеркнуть отдельный слог/букву. */
-.run { border-bottom: 2px solid transparent; }
-.run-annotated { border-bottom-style: solid; }
-.word-input {
-  font: inherit;
-  color: #fff;
-  background: #14161d;
-  border: 1px solid var(--accent);
-  border-radius: 4px;
-  padding: 0 4px;
-  margin-right: 4px;
-  width: 8ch;
-  min-width: 4ch;
-  touch-action: manipulation;
-}
-
 .plain {
   margin: 0;
   padding: 20px;
@@ -1368,57 +595,15 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
 }
 .plain.raw { font-family: monospace; font-size: 12px; color: var(--muted); }
 
-.annos {
-  border-top: 1px solid var(--border);
-  padding: 12px 20px 4px;
-}
-.annos-head {
-  font-size: 12px;
-  text-transform: uppercase;
-  letter-spacing: 0.5px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-.anno {
-  display: grid;
-  grid-template-columns: 12px auto auto 1fr auto auto;
-  gap: 10px;
-  align-items: center;
-  padding: 6px 0;
-  cursor: pointer;
-  border-bottom: 1px solid var(--border);
-}
-.anno:last-of-type { border-bottom: none; }
-.anno:hover { background: #1d2030; }
+/* Точка-маркер класса (в панели разметки и в меню классов). */
 .dot {
   width: 10px;
   height: 10px;
   border-radius: 50%;
   display: inline-block;
 }
-.anno-label { font-size: 13px; font-weight: 600; }
-.anno-time { font-size: 12px; font-family: monospace; color: var(--muted); }
-.anno-text {
-  font-size: 13px;
-  color: var(--muted);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.anno-edit,
-.anno-del {
-  background: none;
-  border: none;
-  color: var(--muted);
-  font-size: 16px;
-  cursor: pointer;
-  line-height: 1;
-}
-.anno-del { font-size: 18px; }
-.anno-edit:hover { color: var(--accent); }
-.anno-del:hover { color: var(--error); }
-.anno-err { color: var(--error); font-size: 13px; margin: 8px 0; }
 
+/* Базовый каркас всплывающих меню (классы + спикер). Специфика — в компонентах. */
 .ctx-menu {
   position: fixed;
   top: 0;
@@ -1470,60 +655,6 @@ h1 { margin: 0; font-size: 40px; letter-spacing: -1px; }
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
-.ctx-play {
-  align-items: center;
-  color: var(--accent);
-  font-weight: 600;
-  width: 100%;
-  border-bottom: 1px solid var(--border);
-  border-radius: 0;
-  margin-bottom: 4px;
-}
-.ctx-play-icon { flex: 0 0 auto; font-size: 11px; }
-
-.ctx-spk {
-  border-bottom: 1px solid var(--border);
-  padding-bottom: 6px;
-  margin-bottom: 4px;
-}
-.ctx-spk-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding: 2px 10px 4px;
-}
-.ctx-spk-chip {
-  font: inherit;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--accent);
-  background: #14161d;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 3px 10px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-.ctx-spk-chip:hover {
-  border-color: var(--accent);
-  background: #1d2030;
-}
-.ctx-spk-new {
-  font: inherit;
-  font-size: 13px;
-  color: var(--text);
-  background: #14161d;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 3px 8px;
-  width: 9ch;
-  min-width: 7ch;
-}
-.ctx-spk-new:focus {
-  outline: none;
-  border-color: var(--accent);
-}
-.ctx-spk-create { color: #7ee0a0; }
 
 .btn {
   background: var(--accent);

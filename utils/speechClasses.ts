@@ -14,7 +14,12 @@ export enum SpeechClass {
   LispInterdental = 'lisp_interdental',
   LispLateral = 'lisp_lateral',
   LispNasal = 'lisp_nasal',
-  LispLabiodental = 'lisp_labiodental'
+  LispLabiodental = 'lisp_labiodental',
+  // Дислексия
+  Dyslexia = 'dyslexia',
+  // Голос (спастическая дисфония)
+  VoiceSpasm = 'voice_spasm',
+  LarynxMicrospasm = 'larynx_microspasm'
 }
 
 export interface SpeechClassMeta {
@@ -80,6 +85,34 @@ export const SPEECH_CLASSES: SpeechClassMeta[] = [
     color: '#a06cff',
     description:
       'Звук похож на Ф: «санки → фанки», «шапка → фапка».'
+  },
+
+  // --- Дислексия ---
+  {
+    id: SpeechClass.Dyslexia,
+    group: 'Дислексия',
+    label: 'Замены / перестановки',
+    color: '#e0b040',
+    description:
+      'Путает слова или буквы в слове, меняет буквы на другие. Напр.: «молоко → момоко», перестановка букв/слогов.'
+  },
+
+  // --- Голос (спастическая дисфония) ---
+  {
+    id: SpeechClass.VoiceSpasm,
+    group: 'Голос',
+    label: 'Голосовой спазм',
+    color: '#ff5c7a',
+    description:
+      'Спастическая дисфония: вставки звуков из-за нарушения координации дыхания и голоса — голос прерывистый, «зажатый», будто связки хлюпают.'
+  },
+  {
+    id: SpeechClass.LarynxMicrospasm,
+    group: 'Голос',
+    label: 'Микросудороги гортани',
+    color: '#b56cff',
+    description:
+      'Мелкие судорожные подёргивания гортани: короткие сбои и дрожание голоса без полного блока.'
   }
 ]
 
